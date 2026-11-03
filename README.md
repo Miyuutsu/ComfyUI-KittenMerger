@@ -9,14 +9,14 @@ An advanced, high-performance ComfyUI custom node pack built for deep model insp
 ### 1. Anima Model Merger (`AnimaModelMerger`)
 * **Unlimited Dynamic Inputs & Outputs:** Automatically expands model input slots (`model_1`, `model_2`...) as you connect wires, and dynamically exposes model outputs and intermediate stage outputs (`model_s1`, `model_s2`...).
 * **Multi-Stage Workflow Chaining:** Chain complex sequential merges (e.g., `s1 = m1 + m2`, `s2 = s1 + m3`, `s3 = s2 - m4`) inside a single node.
-* **3-Level Hierarchical DOM UI:** A scrollable, collapsible tree interface allowing you to fine-tune weights and operations (`ws`, `add`, `sub`, `add_diff`, `cosine_a`, `cosine_b`) at four distinct levels:
+* **4-Level Hierarchical DOM UI:** A scrollable, collapsible tree interface allowing you to fine-tune weights and operations (`ws`, `add`, `sub`, `add_diff`, `cosine_a`, `cosine_b`) at four distinct levels:
   * **Global Stage Level**
   * **Block / Group Level** (`blocks.0.`, `embedders.`, `llm_adapter.`, `final_layer.`)
   * **Sub-Layer Level** (`self_attn.`, `cross_attn.`, `mlp.`, etc.)
   * **Leaf Tensor Level** (`q_proj.weight`, `k_norm.weight`, etc.)
 * **Inheritance & Detachment:** Child nodes inherit from their parents until manually tweaked. Detached rows highlight in orange with an **`[R]` (Reattach)** button. Supports multi-row shift/ctrl selection and delta dragging.
 * **1-Click "Fix Zeros":** Automatically detects unpopulated or dead zero layers in source models and maps them correctly during stage evaluations.
-* **Legacy Import/Export:** Import/export stage JSON recipes, full multi-stage project recipes, or automatically parse legacy workflow JSONs containing `ModelMergeAnima2_9B` and `ModelMergeAnima2_9B_Granular` nodes.
+* **Legacy Import/Export:** Import/export stage JSON recipes, full multi-stage project recipes, or automatically parse legacy workflow JSONs.
 
 ### 2. Model Inspector (`ModelMergeInspector`)
 * **Automatic Lineage & Verification:** Wire the `merge_schema` output from the Merger directly into the Inspector to automatically track per-key contributions and verify layer arithmetic.
@@ -37,7 +37,7 @@ An advanced, high-performance ComfyUI custom node pack built for deep model insp
    ```
 2. Clone this repository:
    ```bash
-   git clone https://github.com/your-username/ComfyUI-KittenMerger.git
+   git clone https://github.com/Miyuutsu/ComfyUI-KittenMerger
    ```
 3. Restart ComfyUI.
 
@@ -61,4 +61,4 @@ ComfyUI-KittenMerger/
 
 ## License
 
-Distributed under the MIT License. See `LICENSE` for more information.
+Distributed under GNU General Public License v3.0. See `LICENSE` for more information.
