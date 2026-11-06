@@ -242,6 +242,29 @@ def materialize_patched_state_dict(model_patcher, device=None):
     return out
 
 
+def is_tensor_zero_fast(tensor, zero_tol=1e-3):
+    """
+    Fast CPU-first check for whether a tensor is effectively zero.
+    Checks the first 64 elements before scanning the full tensor, avoiding GPU transfers
+    and avoiding faulting full mmap pages for non-zero weights.
+    """
+    if tensor is None:
+        return True
+    if not tensor.is_floating_point() or tensor.numel() == 0:
+        return True
+    flat = tensor.detach().reshape(-1)
+    sample = flat[:64]. float()
+    if not torch.isfinite(sample).all():
+        return False
+    if float(sample.abs().max().item()) > zero_tol:
+        return False
+    # First 64 elements are <= zero_tol; verify full tensor on CPU without copying to GPU
+    full_max = float(flat.abs().max().item())
+    if not math.isfinite(full_max):
+        return False
+    return full_max <= zero_tol
+
+
 def inspect_tensor_stats(tensor, device=None):
     if tensor is None:
         return None, False

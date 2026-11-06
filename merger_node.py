@@ -14,9 +14,10 @@ from .utils import (
     MergerSchemaPayload,
     convert_state_dict_to_tier,
     detect_block_tier,
-     get_model_signature,
+    get_model_signature,
     inspect_tensor_diff,
     inspect_tensor_stats,
+    is_tensor_zero_fast,
     materialize_patched_state_dict,
     natural_sort_key,
     parse_key_for_block,
@@ -163,7 +164,7 @@ def resolve_weight_and_op_for_key(clean_key, stage_data, runtime_overrides=None)
     return w, op, w_over, op_over
 
 
-def get_cached_source_stats(src_id, sd, all_target_keys, stats_cache, device=None):
+def get_cached_source_stats(src_id, sd, all_target_keys, stats_cache, is_lora=False, zero_tol=ZERO_FIX_TOLERANCE):
     if src_id in stats_cache:
         return stats_cache[src_id]
 
@@ -174,19 +175,26 @@ def get_cached_source_stats(src_id, sd, all_target_keys, stats_cache, device=Non
 
     for k in all_target_keys:
         t = sd.get(k)
-        w, _ = inspect_tensor_stats(t, device=device) if t is not None else (0.0, False)
-        n = w or 0.0
+        _, b_idx, suffix = parse_key_for_block(k)
+        is_gate = suffix is not None and any(suffix.endswith(z) for z in ZERO_INIT_SUFFIXES)
+
+        # Fast CPU slice check: 99% of active weights exit in < 5 microseconds on the first 64 elements
+        if t is None or is_tensor_zero_fast(t, zero_tol=zero_tol):
+            n = 0.0
+        else:
+            n = 1.0
+
         key_norms[k] = n
 
-        clean_k = strip_diffusion_prefix(k)
-        _, lvl2, _ = resolve_key_hierarchy(clean_k)
-        if lvl2:
-            sublayer_max[lvl2] = max(sublayer_max.get(lvl2, 0.0), n)
+        if is_lora:
+            clean_k = strip_diffusion_prefix(k)
+            _, lvl2, _ = resolve_key_hierarchy(clean_k)
+            if lvl2:
+                sublayer_max[lvl2] = max(sublayer_max.get(lvl2, 0.0), n)
 
-        _, b_idx, suffix = parse_key_for_block(k)
         if b_idx is not None:
             block_all.setdefault(b_idx, []).append(n)
-            if suffix is not None and any(suffix.endswith(z) for z in ZERO_INIT_SUFFIXES):
+            if is_gate:
                 block_gates.setdefault(b_idx, []).append(n)
 
     entry = {
@@ -211,8 +219,12 @@ def compute_stage_zero_fix_overrides(
     device=None,
     zero_tol=ZERO_FIX_TOLERANCE,
 ):
-    st_a = get_cached_source_stats(model_a_id, sd_a, all_target_keys, stats_cache, device=device)
-    st_b = get_cached_source_stats(model_b_id, sd_b, all_target_keys, stats_cache, device=device)
+    st_a = get_cached_source_stats(
+        model_a_id, sd_a, all_target_keys, stats_cache, is_lora=is_a_lora, zero_tol=zero_tol
+    )
+    st_b = get_cached_source_stats(
+        model_b_id, sd_b, all_target_keys, stats_cache, is_lora=is_b_lora, zero_tol=zero_tol
+    )
 
     key_norms_a = st_a["key_norms"]
     key_norms_b = st_b["key_norms"]
@@ -995,21 +1007,23 @@ class AnimaModelMerger:
         active_m_list = [m for m in m_ids if m in active_m_ids]
 
         pbar = comfy.utils.ProgressBar(100)
-        send_kitten_progress(unique_id, "Step 1/4: Resolving Inputs", f"0/{len(active_m_list)} models", 0, 100)
+        send_kitten_progress(unique_id, "Step 1/4: Resolving Inputs", f"0/{len(active_m_list)} models", 0, len(active_m_list))
 
-        for idx, m in enumerate(m_ids):
+        active_load_idx = 0
+        for m in m_ids:
             mp = models_dict[m]
             is_lora = bool(getattr(mp, "_kitten_is_lora", False))
             source_is_lora[m] = is_lora
             if m not in active_m_ids:
                 continue
+            active_load_idx += 1
             disp_m = model_names_by_id.get(m, m)
             send_kitten_progress(
                 unique_id,
                 "Step 1/4: Resolving Inputs",
-                f"{m} ({disp_m})",
-                int((idx / max(1, len(m_ids))) * 15),
-                100,
+                f"{m} ({disp_m}) [{active_load_idx}/{len(active_m_list)}]",
+                active_load_idx,
+                len(active_m_list),
             )
             if is_lora:
                 raw_sds[m] = mp.materialize_state_dict(dtype=torch.bfloat16, device=device)
@@ -1019,7 +1033,7 @@ class AnimaModelMerger:
             tiers_by_id[m] = tier
 
         timings["Load/Resolve"] = time.perf_counter() - t_phase
-        pbar.update_absolute(15, 100)
+        pbar.update_absolute(10, 100)
 
         t_phase = time.perf_counter()
         resolved_tier = self._determine_target_tier(target_tier, tiers_by_id, active_m_list)
@@ -1040,16 +1054,18 @@ class AnimaModelMerger:
 
         aligned_sds = {}
         skipped_blocks_by_source = {}
+        scaled_models_converted = set()
 
-        for idx, m in enumerate(active_m_list):
+        for idx, m in enumerate(active_m_list, start=1):
             orig_tier = tiers_by_id[m]
             if orig_tier != resolved_tier and orig_tier is not None:
+                scaled_models_converted.add(m)
                 send_kitten_progress(
                     unique_id,
                     "Step 2/4: Scaling Architecture",
                     f"{m}: {orig_tier} -> {resolved_tier} blocks",
-                    15 + int((idx / max(1, len(active_m_list))) * 10),
-                    100,
+                    idx,
+                    len(active_m_list),
                 )
             conv_sd, skipped_set = convert_state_dict_to_tier(
                 raw_sds.pop(m),
@@ -1066,7 +1082,7 @@ class AnimaModelMerger:
 
         del raw_sds
         timings["Tier Scale"] = time.perf_counter() - t_phase
-        pbar.update_absolute(25, 100)
+        pbar.update_absolute(20, 100)
 
         clean_to_ref_key = {}
         for k in aligned_sds[template_m_id].keys():
@@ -1089,13 +1105,13 @@ class AnimaModelMerger:
             m: {k: {m: 1.0} for k in aligned_sds[m].keys()}
             for m in active_m_list
         }
+        direct_stage_lineage = {}
 
         stage_summaries = []
         stage_summaries_by_id = {}
         stage_zero_fixes = {}
         stats_cache = AnimaModelMerger._source_stats_cache
 
-        # Map each base model ID to a stable cache key so swapping models never collides on "m1"
         source_cache_keys = {
             m: (
                 get_model_signature(models_dict[m]),
@@ -1110,6 +1126,8 @@ class AnimaModelMerger:
         t_phase = time.perf_counter()
         prepared_stages = []
         stages_needing_deferred_zero_fix = set()
+        fz_stage_list = [s_id for s_id in stage_ids_in_order if s_id in active_stage_ids and stage_meta_by_id[s_id]["st"].get("fix_zeros", False)]
+        fz_idx = 0
 
         for s_id in stage_ids_in_order:
             meta = stage_meta_by_id[s_id]
@@ -1131,17 +1149,19 @@ class AnimaModelMerger:
 
             sources_sd[s_id] = {}
             sources_lineage[s_id] = {}
+            direct_stage_lineage[s_id] = {}
             skipped_blocks_by_source[s_id] = set()
 
             runtime_zero_ov = None
             if st.get("fix_zeros", False):
+                fz_idx += 1
                 if model_a_id in aligned_sds and model_b_id in aligned_sds:
                     send_kitten_progress(
                         unique_id,
                         "Step 2/4: Scanning Fix Zeros",
-                        f"Stage {s_id} ({model_a_id} vs {model_b_id})",
-                        28,
-                        100,
+                        f"Stage {s_id} ({model_a_id} vs {model_b_id}) [{fz_idx}/{max(1, len(fz_stage_list))}]",
+                        fz_idx,
+                        max(1, len(fz_stage_list)),
                     )
                     auto_zero_ov = compute_stage_zero_fix_overrides(
                         source_cache_keys.get(model_a_id, model_a_id),
@@ -1157,14 +1177,13 @@ class AnimaModelMerger:
                     stage_zero_fixes[s_id] = auto_zero_ov
                     runtime_zero_ov = auto_zero_ov
                 else:
-                    # One of the inputs is a prior stage (e.g. s1); pre-scan any base model input now
                     if model_a_id in aligned_sds:
                         get_cached_source_stats(
                             source_cache_keys.get(model_a_id, model_a_id),
                             aligned_sds[model_a_id],
                             all_target_keys,
                             stats_cache,
-                            device=device,
+                            is_lora=is_a_lora,
                         )
                     if model_b_id in aligned_sds:
                         get_cached_source_stats(
@@ -1172,7 +1191,7 @@ class AnimaModelMerger:
                             aligned_sds[model_b_id],
                             all_target_keys,
                             stats_cache,
-                            device=device,
+                            is_lora=is_b_lora,
                         )
                     stages_needing_deferred_zero_fix.add(s_id)
 
@@ -1220,11 +1239,13 @@ class AnimaModelMerger:
             })
 
         timings["Fix Zeros Scan"] = time.perf_counter() - t_phase
-        pbar.update_absolute(30, 100)
+        pbar.update_absolute(25, 100)
 
-        # Precompute stats & parent diffs during merge if Inspector is wired downstream or deferred Fix Zeros is needed
         precomputed_stats = {s_id: {} for s_id in enabled_in_order}
+        for m in active_m_list:
+            precomputed_stats[m] = {}
         precomputed_pair_diffs = {}
+
         stage_ids_needed_for_zero_fix = set()
         for ps in prepared_stages:
             if ps["s_id"] in stages_needing_deferred_zero_fix:
@@ -1233,228 +1254,287 @@ class AnimaModelMerger:
                 if ps["model_b_id"] not in aligned_sds:
                     stage_ids_needed_for_zero_fix.add(ps["model_b_id"])
 
-        for m in active_m_list:
-            ck = source_cache_keys.get(m, m)
-            if ck in stats_cache:
-                precomputed_stats[m] = {k: (v, False) for k, v in stats_cache[ck]["key_norms"].items()}
+        # Base models whose converted state dicts must be kept in RAM after merging (for passthroughpatcher build)
+        keep_aligned_sd_m_ids = {
+            m for m in active_m_list
+            if source_is_lora.get(m, False) or (m in scaled_models_converted and m in wired_passthrough_m_ids)
+        }
+
+        # Group keys by block/section so we process one architectural block at a time
+        block_groups = []
+        current_group_label = None
+        current_group_keys = []
+        max_blk_idx = max(0, (resolved_tier or 40) - 1)
+
+        for k in (all_target_keys if prepared_stages else ()):
+            _, b_idx, _ = parse_key_for_block(k)
+            if b_idx is not None:
+                lbl = f"Block {b_idx:02d}/{max_blk_idx:02d}"
+            elif "llm_adapter" in k:
+                lbl = "LLM Adapter"
+            elif "final_layer" in k:
+                lbl = "Final Layer"
+            else:
+                lbl = "Embedders"
+
+            if lbl != current_group_label:
+                if current_group_keys:
+                    block_groups.append((current_group_label, current_group_keys))
+                current_group_label = lbl
+                current_group_keys = [k]
+            else:
+                current_group_keys.append(k)
+        if current_group_keys:
+            block_groups.append((current_group_label, current_group_keys))
 
         t_phase = time.perf_counter()
         total_keys = max(1, len(all_target_keys))
-        stage_label_list = ", ".join(ps["s_id"] for ps in prepared_stages)
+        num_stages = len(prepared_stages)
+        stage_header = (
+            f"Step 3/4: Merging {num_stages} Stages"
+            if num_stages > 4
+            else f"Step 3/4: Merging ({', '.join(ps['s_id'] for ps in prepared_stages)})"
+        )
+        processed_keys = 0
 
-        for k_idx, k in enumerate(all_target_keys if prepared_stages else ()):
-            if k_idx % 32 == 0 or k_idx == total_keys - 1:
-                pct = 30 + int(((k_idx + 1) / total_keys) * 55)
-                pbar.update_absolute(pct, 100)
-                send_kitten_progress(
-                    unique_id,
-                    f"Step 3/4: Merging ({stage_label_list})",
-                    f"Key {k_idx + 1}/{total_keys}",
-                    pct,
-                    100,
-                )
+        for grp_label, grp_keys in block_groups:
+            send_kitten_progress(
+                unique_id,
+                f"{stage_header} [{grp_label}]",
+                f"Key {processed_keys + 1}/{total_keys}",
+                processed_keys,
+                total_keys,
+            )
+            pbar.update_absolute(25 + int((processed_keys / total_keys) * 65), 100)
 
-            clean_k = strip_diffusion_prefix(k)
-            _, b_idx, _ = parse_key_for_block(k)
+            for k in grp_keys:
+                processed_keys += 1
+                clean_k = strip_diffusion_prefix(k)
+                _, b_idx, _ = parse_key_for_block(k)
 
-            gpu_calc_tensors = {}
-            cpu_exact_refs = {m: aligned_sds[m].get(k) for m in active_m_list}
+                gpu_calc_tensors = {}
+                cpu_exact_refs = {
+                    m: (
+                        aligned_sds[m].get(k)
+                        if m in keep_aligned_sd_m_ids
+                        else aligned_sds[m].pop(k, None)
+                    )
+                    for m in active_m_list
+                }
 
-            def get_calc_tensor(src_id):
-                if src_id in gpu_calc_tensors:
-                    return gpu_calc_tensors[src_id]
-                cpu_t = cpu_exact_refs.get(src_id)
-                if cpu_t is None and src_id in sources_sd:
-                    cpu_t = sources_sd[src_id].get(k)
-                if cpu_t is None:
-                    return None
-                gt = cpu_t.to(device=device, dtype=calc_dtype)
-                gpu_calc_tensors[src_id] = gt
-                return gt
-
-            for ps in prepared_stages:
-                s_id = ps["s_id"]
-                st = ps["st"]
-                model_a_id = ps["model_a_id"]
-                model_b_id = ps["model_b_id"]
-                model_c_id = ps["model_c_id"]
-                has_model_c = ps["has_model_c"]
-                is_a_lora = ps["is_a_lora"]
-                is_b_lora = ps["is_b_lora"]
-                both_ab_lora = ps["both_ab_lora"]
-                out_stage_is_lora = ps["out_stage_is_lora"]
-                runtime_zero_ov = ps["runtime_zero_ov"]
-                should_store_cpu = s_id in materialized_stage_ids
-                need_stage_norm = has_downstream_inspector or (s_id in stage_ids_needed_for_zero_fix)
-
-                # Handle deferred per-key Fix Zeros when an input is a prior stage (e.g. s1)
-                if s_id in stages_needing_deferred_zero_fix:
-                    a_stat = precomputed_stats.get(model_a_id, {}).get(k)
-                    if a_stat is None:
-                        ck_a = source_cache_keys.get(model_a_id, model_a_id)
-                        a_norm = stats_cache.get(ck_a, {}).get("key_norms", {}).get(k, 0.0)
-                    else:
-                        a_norm = a_stat[0] or 0.0
-
-                    b_stat = precomputed_stats.get(model_b_id, {}).get(k)
-                    if b_stat is None:
-                        ck_b = source_cache_keys.get(model_b_id, model_b_id)
-                        b_norm = stats_cache.get(ck_b, {}).get("key_norms", {}).get(k, 0.0)
-                    else:
-                        b_norm = b_stat[0] or 0.0
-
-                    a_zero = a_norm <= ZERO_FIX_TOLERANCE
-                    b_zero = b_norm <= ZERO_FIX_TOLERANCE
-                    if b_zero and not a_zero:
-                        runtime_zero_ov = {clean_k: 1.0}
-                        stage_zero_fixes.setdefault(s_id, {})[clean_k] = 1.0
-                    elif a_zero and not b_zero:
-                        runtime_zero_ov = {clean_k: 0.0}
-                        stage_zero_fixes.setdefault(s_id, {})[clean_k] = 0.0
-                    else:
-                        runtime_zero_ov = None
-                    ps["runtime_zero_ov"] = runtime_zero_ov
-
-                lin_a = sources_lineage[model_a_id].get(k, {})
-                lin_b = sources_lineage[model_b_id].get(k, {})
-                lin_c = sources_lineage[model_c_id].get(k, {}) if has_model_c else None
-
-                w, op, has_w_override, has_op_override = resolve_weight_and_op_for_key(
-                    clean_k, st, runtime_overrides=runtime_zero_ov
-                )
-
-                skip_a = skipped_blocks_by_source.get(model_a_id, set())
-                skip_b = skipped_blocks_by_source.get(model_b_id, set())
-                if b_idx is not None and not has_w_override and not has_op_override and op == "ws":
-                    b_in_a_skip = b_idx in skip_a
-                    b_in_b_skip = b_idx in skip_b
-                    if b_in_b_skip and not b_in_a_skip:
-                        w = 1.0
-                    elif b_in_a_skip and not b_in_b_skip:
-                        w = 0.0
-                    elif b_in_a_skip and b_in_b_skip:
-                        skipped_blocks_by_source[s_id].add(b_idx)
-
-                # Zero-copy fast path when weight is 100% Model A or 100% Model B (no GPU transfer needed!)
-                ref_a = cpu_exact_refs.get(model_a_id)
-                ref_b = cpu_exact_refs.get(model_b_id)
-
-                if op == "ws" and not both_ab_lora and not is_a_lora and not is_b_lora:
-                    if abs(w - 1.0) <= 1e-7 and ref_a is not None:
-                        cpu_exact_refs[s_id] = ref_a
-                        if model_a_id in gpu_calc_tensors:
-                            gpu_calc_tensors[s_id] = gpu_calc_tensors[model_a_id]
-                        if should_store_cpu:
-                            sources_sd[s_id][k] = ref_a
-                        sources_lineage[s_id][k] = dict(lin_a)
-                        if need_stage_norm:
-                            if model_a_id in precomputed_stats and k in precomputed_stats[model_a_id]:
-                                precomputed_stats[s_id][k] = precomputed_stats[model_a_id][k]
-                            else:
-                                precomputed_stats[s_id][k] = inspect_tensor_stats(ref_a, device=device)
-                        if has_downstream_inspector:
-                            precomputed_pair_diffs.setdefault((model_a_id, s_id), {})[k] = 0.0
-                        continue
-                    if abs(w) <= 1e-7 and ref_b is not None:
-                        cpu_exact_refs[s_id] = ref_b
-                        if model_b_id in gpu_calc_tensors:
-                            gpu_calc_tensors[s_id] = gpu_calc_tensors[model_b_id]
-                        if should_store_cpu:
-                            sources_sd[s_id][k] = ref_b
-                        sources_lineage[s_id][k] = dict(lin_b)
-                        if need_stage_norm:
-                            if model_b_id in precomputed_stats and k in precomputed_stats[model_b_id]:
-                                precomputed_stats[s_id][k] = precomputed_stats[model_b_id][k]
-                            else:
-                                precomputed_stats[s_id][k] = inspect_tensor_stats(ref_b, device=device)
-                        if has_downstream_inspector:
-                            precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = 0.0
-                        continue
-
-                merged_gpu, is_exact_a, is_exact_b = eval_single_key_stage_recipe(
-                    ps, k, clean_k, b_idx, get_calc_tensor, skipped_blocks_by_source
-                )
-                if merged_gpu is None:
-                    continue
-
-                gpu_calc_tensors[s_id] = merged_gpu
-                store_dtype = calc_dtype if not out_stage_is_lora else torch.bfloat16
-
-                if need_stage_norm:
-                    precomputed_stats[s_id][k] = inspect_tensor_stats(merged_gpu, device=device)
+                def get_calc_tensor(src_id):
+                    if src_id in gpu_calc_tensors:
+                        return gpu_calc_tensors[src_id]
+                    cpu_t = cpu_exact_refs.get(src_id)
+                    if cpu_t is None and src_id in sources_sd:
+                        cpu_t = sources_sd[src_id].get(k)
+                    if cpu_t is None:
+                        return None
+                    gt = cpu_t.to(device=device, dtype=calc_dtype)
+                    gpu_calc_tensors[src_id] = gt
+                    return gt
 
                 if has_downstream_inspector:
                     for src_m in active_m_list:
-                        if src_m in gpu_calc_tensors and src_m not in precomputed_stats.get(src_m, {}):
-                            precomputed_stats.setdefault(src_m, {})[k] = inspect_tensor_stats(
-                                gpu_calc_tensors[src_m], device=device
+                        if k not in precomputed_stats[src_m]:
+                            t_src = cpu_exact_refs.get(src_m)
+                            if t_src is not None:
+                                if is_tensor_zero_fast(t_src, zero_tol=ZERO_FIX_TOLERANCE):
+                                    precomputed_stats[src_m][k] = (0.0, False)
+                                else:
+                                    gt_src = get_calc_tensor(src_m)
+                                    precomputed_stats[src_m][k] = inspect_tensor_stats(gt_src, device=device)
+
+                for ps in prepared_stages:
+                    s_id = ps["s_id"]
+                    st = ps["st"]
+                    model_a_id = ps["model_a_id"]
+                    model_b_id = ps["model_b_id"]
+                    model_c_id = ps["model_c_id"]
+                    has_model_c = ps["has_model_c"]
+                    is_a_lora = ps["is_a_lora"]
+                    is_b_lora = ps["is_b_lora"]
+                    is_c_lora = ps["is_c_lora"]
+                    both_ab_lora = ps["both_ab_lora"]
+                    out_stage_is_lora = ps["out_stage_is_lora"]
+                    runtime_zero_ov = ps["runtime_zero_ov"]
+                    should_store_cpu = s_id in materialized_stage_ids
+                    need_stage_norm = has_downstream_inspector or (s_id in stage_ids_needed_for_zero_fix)
+
+                    if s_id in stages_needing_deferred_zero_fix:
+                        a_stat = precomputed_stats.get(model_a_id, {}).get(k)
+                        if a_stat is None:
+                            ck_a = source_cache_keys.get(model_a_id, model_a_id)
+                            a_norm = stats_cache.get(ck_a, {}).get("key_norms", {}).get(k, 0.0)
+                        else:
+                            a_norm = a_stat[0] or 0.0
+
+                        b_stat = precomputed_stats.get(model_b_id, {}).get(k)
+                        if b_stat is None:
+                            ck_b = source_cache_keys.get(model_b_id, model_b_id)
+                            b_norm = stats_cache.get(ck_b, {}).get("key_norms", {}).get(k, 0.0)
+                        else:
+                            b_norm = b_stat[0] or 0.0
+
+                        a_zero = a_norm <= ZERO_FIX_TOLERANCE
+                        b_zero = b_norm <= ZERO_FIX_TOLERANCE
+                        if b_zero and not a_zero:
+                            runtime_zero_ov = {clean_k: 1.0}
+                            stage_zero_fixes.setdefault(s_id, {})[clean_k] = 1.0
+                        elif a_zero and not b_zero:
+                            runtime_zero_ov = {clean_k: 0.0}
+                            stage_zero_fixes.setdefault(s_id, {})[clean_k] = 0.0
+                        else:
+                            runtime_zero_ov = None
+                        ps["runtime_zero_ov"] = runtime_zero_ov
+
+                    lin_a = sources_lineage[model_a_id].get(k, {})
+                    lin_b = sources_lineage[model_b_id].get(k, {})
+                    lin_c = sources_lineage[model_c_id].get(k, {}) if has_model_c else None
+
+                    w, op, has_w_override, has_op_override = resolve_weight_and_op_for_key(
+                        clean_k, st, runtime_overrides=runtime_zero_ov
+                    )
+
+                    skip_a = skipped_blocks_by_source.get(model_a_id, set())
+                    skip_b = skipped_blocks_by_source.get(model_b_id, set())
+                    if b_idx is not None and not has_w_override and not has_op_override and op == "ws":
+                        b_in_a_skip = b_idx in skip_a
+                        b_in_b_skip = b_idx in skip_b
+                        if b_in_b_skip and not b_in_a_skip:
+                            w = 1.0
+                        elif b_in_a_skip and not b_in_b_skip:
+                            w = 0.0
+                        elif b_in_a_skip and b_in_b_skip:
+                            skipped_blocks_by_source[s_id].add(b_idx)
+
+                    ref_a = cpu_exact_refs.get(model_a_id)
+                    ref_b = cpu_exact_refs.get(model_b_id)
+
+                    if op == "ws" and not both_ab_lora and not is_a_lora and not is_b_lora:
+                        if abs(w - 1.0) <= 1e-7 and ref_a is not None:
+                            cpu_exact_refs[s_id] = ref_a
+                            if model_a_id in gpu_calc_tensors:
+                                gpu_calc_tensors[s_id] = gpu_calc_tensors[model_a_id]
+                            if should_store_cpu:
+                                sources_sd[s_id][k] = ref_a
+                            sources_lineage[s_id][k] = dict(lin_a)
+                            direct_stage_lineage[s_id][k] = {model_a_id: 1.0}
+                            if need_stage_norm:
+                                if model_a_id in precomputed_stats and k in precomputed_stats[model_a_id]:
+                                    precomputed_stats[s_id][k] = precomputed_stats[model_a_id][k]
+                                else:
+                                    precomputed_stats[s_id][k] = inspect_tensor_stats(ref_a, device=device)
+                            if has_downstream_inspector:
+                                precomputed_pair_diffs.setdefault((model_a_id, s_id), {})[k] = 0.0
+                            continue
+                        if abs(w) <= 1e-7 and ref_b is not None:
+                            cpu_exact_refs[s_id] = ref_b
+                            if model_b_id in gpu_calc_tensors:
+                                gpu_calc_tensors[s_id] = gpu_calc_tensors[model_b_id]
+                            if should_store_cpu:
+                                sources_sd[s_id][k] = ref_b
+                            sources_lineage[s_id][k] = dict(lin_b)
+                            direct_stage_lineage[s_id][k] = {model_b_id: 1.0}
+                            if need_stage_norm:
+                                if model_b_id in precomputed_stats and k in precomputed_stats[model_b_id]:
+                                    precomputed_stats[s_id][k] = precomputed_stats[model_b_id][k]
+                                else:
+                                    precomputed_stats[s_id][k] = inspect_tensor_stats(ref_b, device=device)
+                            if has_downstream_inspector:
+                                precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = 0.0
+                            continue
+
+                    merged_gpu, is_exact_a, is_exact_b = eval_single_key_stage_recipe(
+                        ps, k, clean_k, b_idx, get_calc_tensor, skipped_blocks_by_source
+                    )
+                    if merged_gpu is None:
+                        continue
+
+                    gpu_calc_tensors[s_id] = merged_gpu
+                    store_dtype = calc_dtype if not out_stage_is_lora else torch.bfloat16
+
+                    if need_stage_norm:
+                        precomputed_stats[s_id][k] = inspect_tensor_stats(merged_gpu, device=device)
+
+                    if has_downstream_inspector:
+                        ta_g = gpu_calc_tensors.get(model_a_id)
+                        if ta_g is not None and ta_g.shape == merged_gpu.shape and not is_a_lora:
+                            precomputed_pair_diffs.setdefault((model_a_id, s_id), {})[k] = (
+                                0.0 if is_exact_a else inspect_tensor_diff(ta_g, merged_gpu, device=device)
                             )
-                    ta_g = gpu_calc_tensors.get(model_a_id)
-                    if ta_g is not None and ta_g.shape == merged_gpu.shape and not is_a_lora:
-                        precomputed_pair_diffs.setdefault((model_a_id, s_id), {})[k] = (
-                            0.0 if is_exact_a else inspect_tensor_diff(ta_g, merged_gpu, device=device)
-                        )
-                    tb_g = gpu_calc_tensors.get(model_b_id)
-                    if tb_g is not None and tb_g.shape == merged_gpu.shape and not is_b_lora:
-                        precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = (
-                            0.0 if is_exact_b else inspect_tensor_diff(tb_g, merged_gpu, device=device)
-                        )
+                        tb_g = gpu_calc_tensors.get(model_b_id)
+                        if tb_g is not None and tb_g.shape == merged_gpu.shape and not is_b_lora:
+                            precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = (
+                                0.0 if is_exact_b else inspect_tensor_diff(tb_g, merged_gpu, device=device)
+                            )
+                        if has_model_c and not is_c_lora:
+                            tc_g = gpu_calc_tensors.get(model_c_id)
+                            if tc_g is not None and tc_g.shape == merged_gpu.shape:
+                                precomputed_pair_diffs.setdefault((model_c_id, s_id), {})[k] = inspect_tensor_diff(
+                                    tc_g, merged_gpu, device=device
+                                )
 
-                if is_exact_a and ref_a is not None and ref_a.dtype == store_dtype:
-                    cpu_exact_refs[s_id] = ref_a
-                    if should_store_cpu:
-                        sources_sd[s_id][k] = ref_a
-                elif is_exact_b and ref_b is not None and ref_b.dtype == store_dtype:
-                    cpu_exact_refs[s_id] = ref_b
-                    if should_store_cpu:
-                        sources_sd[s_id][k] = ref_b
-                elif should_store_cpu:
-                    cpu_t = merged_gpu.to(device="cpu", dtype=store_dtype).contiguous()
-                    cpu_exact_refs[s_id] = cpu_t
-                    sources_sd[s_id][k] = cpu_t
+                    if is_exact_a and ref_a is not None and ref_a.dtype == store_dtype:
+                        cpu_exact_refs[s_id] = ref_a
+                        if should_store_cpu:
+                            sources_sd[s_id][k] = ref_a
+                    elif is_exact_b and ref_b is not None and ref_b.dtype == store_dtype:
+                        cpu_exact_refs[s_id] = ref_b
+                        if should_store_cpu:
+                            sources_sd[s_id][k] = ref_b
+                    elif should_store_cpu:
+                        cpu_t = merged_gpu.to(device="cpu", dtype=store_dtype).contiguous()
+                        cpu_exact_refs[s_id] = cpu_t
+                        sources_sd[s_id][k] = cpu_t
 
-                # Record lineage for merge_schema
-                if is_exact_a:
-                    sources_lineage[s_id][k] = dict(lin_a)
-                elif is_exact_b:
-                    sources_lineage[s_id][k] = dict(lin_b)
-                elif op == "ws":
-                    if not is_a_lora and is_b_lora:
-                        sources_lineage[s_id][k] = combine_lineage_dicts([(1.0, lin_a), (1.0 - w, lin_b)])
-                    elif is_a_lora and not is_b_lora:
-                        sources_lineage[s_id][k] = combine_lineage_dicts([(w, lin_a), (1.0, lin_b)])
-                    else:
-                        sources_lineage[s_id][k] = combine_lineage_dicts([(w, lin_a), (1.0 - w, lin_b)])
-                elif op == "add":
-                    sources_lineage[s_id][k] = combine_lineage_dicts([(1.0, lin_a), (w, lin_b)])
-                elif op == "sub":
-                    sources_lineage[s_id][k] = combine_lineage_dicts([(1.0, lin_a), (-w, lin_b)])
-                elif op == "add_diff":
-                    if lin_c is not None:
-                        sources_lineage[s_id][k] = combine_lineage_dicts([(1.0, lin_a), (w, lin_b), (-w, lin_c)])
-                    else:
+                    # Record both full root lineage and direct parent lineage for merge_schema
+                    dir_a = {model_a_id: 1.0}
+                    dir_b = {model_b_id: 1.0}
+                    dir_c = {model_c_id: 1.0} if has_model_c else None
+
+                    if is_exact_a:
+                        sources_lineage[s_id][k] = dict(lin_a)
+                        direct_stage_lineage[s_id][k] = dir_a
+                    elif is_exact_b:
+                        sources_lineage[s_id][k] = dict(lin_b)
+                        direct_stage_lineage[s_id][k] = dir_b
+                    elif op == "ws":
+                        if not is_a_lora and is_b_lora:
+                            terms = [(1.0, lin_a), (1.0 - w, lin_b)]
+                            d_terms = [(1.0, dir_a), (1.0 - w, dir_b)]
+                        elif is_a_lora and not is_b_lora:
+                            terms = [(w, lin_a), (1.0, lin_b)]
+                            d_terms = [(w, dir_a), (1.0, dir_b)]
+                        else:
+                            terms = [(w, lin_a), (1.0 - w, lin_b)]
+                            d_terms = [(w, dir_a), (1.0 - w, dir_b)]
+                        sources_lineage[s_id][k] = combine_lineage_dicts(terms)
+                        direct_stage_lineage[s_id][k] = combine_lineage_dicts(d_terms)
+                    elif op == "add":
                         sources_lineage[s_id][k] = combine_lineage_dicts([(1.0, lin_a), (w, lin_b)])
-                elif op in ("cosine_a", "cosine_b"):
-                    sources_lineage[s_id][k] = combine_lineage_dicts([(w, lin_a), (1.0 - w, lin_b)])
+                        direct_stage_lineage[s_id][k] = combine_lineage_dicts([(1.0, dir_a), (w, dir_b)])
+                    elif op == "sub":
+                        sources_lineage[s_id][k] = combine_lineage_dicts([(1.0, lin_a), (-w, lin_b)])
+                        direct_stage_lineage[s_id][k] = combine_lineage_dicts([(1.0, dir_a), (-w, dir_b)])
+                    elif op == "add_diff":
+                        if lin_c is not None:
+                            sources_lineage[s_id][k] = combine_lineage_dicts([(1.0, lin_a), (w, lin_b), (-w, lin_c)])
+                            direct_stage_lineage[s_id][k] = combine_lineage_dicts([(1.0, dir_a), (w, dir_b), (-w, dir_c)])
+                        else:
+                            sources_lineage[s_id][k] = combine_lineage_dicts([(1.0, lin_a), (w, lin_b)])
+                            direct_stage_lineage[s_id][k] = combine_lineage_dicts([(1.0, dir_a), (w, dir_b)])
+                    elif op in ("cosine_a", "cosine_b"):
+                        sources_lineage[s_id][k] = combine_lineage_dicts([(w, lin_a), (1.0 - w, lin_b)])
+                        direct_stage_lineage[s_id][k] = combine_lineage_dicts([(w, dir_a), (1.0 - w, dir_b)])
 
-                # Compute root-parent diffs for multi-stage chains so Inspector lineage needs 0 GPU calls
-                if has_downstream_inspector:
-                    for root_m in sources_lineage[s_id].get(k, {}):
-                        if (root_m, s_id) not in precomputed_pair_diffs or k not in precomputed_pair_diffs[(root_m, s_id)]:
-                            if not source_is_lora.get(root_m, False):
-                                tr_g = get_calc_tensor(root_m)
-                                if tr_g is not None and tr_g.shape == merged_gpu.shape:
-                                    precomputed_pair_diffs.setdefault((root_m, s_id), {})[k] = inspect_tensor_diff(
-                                        tr_g, merged_gpu, device=device
-                                    )
-
-            gpu_calc_tensors.clear()
-            cpu_exact_refs.clear()
+                gpu_calc_tensors.clear()
+                cpu_exact_refs.clear()
 
         timings[f"Merge ({len(prepared_stages)} st)"] = time.perf_counter() - t_phase
         t_phase = time.perf_counter()
-        send_kitten_progress(unique_id, "Step 4/4: Building Outputs", "Wrapping ModelPatchers", 90, 100)
-        pbar.update_absolute(90, 100)
+        send_kitten_progress(unique_id, "Step 4/4: Building Outputs", "Wrapping ModelPatchers", 1, 1)
+        pbar.update_absolute(92, 100)
 
         passthrough_mps = {}
         for i in range(1, json_model_output_count + 1):
@@ -1530,6 +1610,7 @@ class AnimaModelMerger:
         palette = []
         palette_map = {}
         stage_key_maps = {}
+        stage_direct_maps = {}
 
         for s_id in enabled_in_order:
             s_kmap = {}
@@ -1540,6 +1621,15 @@ class AnimaModelMerger:
                     palette.append(lin_dict)
                 s_kmap[k] = palette_map[sig_str]
             stage_key_maps[s_id] = s_kmap
+
+            d_kmap = {}
+            for k, d_dict in direct_stage_lineage.get(s_id, {}).items():
+                d_sig_str = json.dumps(d_dict, sort_keys=True)
+                if d_sig_str not in palette_map:
+                    palette_map[d_sig_str] = len(palette)
+                    palette.append(d_dict)
+                d_kmap[k] = palette_map[d_sig_str]
+            stage_direct_maps[s_id] = d_kmap
 
         # Bundle only active models and active stages for ModelMergeInspector
         inspector_m_ids = set()
@@ -1574,6 +1664,7 @@ class AnimaModelMerger:
                 "palette": palette,
                 "key_map": stage_key_maps.get(last_active_stage_id, {}) if last_active_stage_id else {},
                 "stage_key_maps": stage_key_maps,
+                "stage_direct_maps": stage_direct_maps,
             }),
             bundled_models=bundled_models,
             stage_recipes=prepared_stages,

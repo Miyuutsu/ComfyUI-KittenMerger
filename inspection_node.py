@@ -85,6 +85,7 @@ def parse_merger_json_schema(schema_str, models_dict):
         m_ids = list(models_dict.keys())
         palette = data.get("palette", [])
         stage_key_maps = data.get("stage_key_maps") or {}
+        stage_direct_maps = data.get("stage_direct_maps") or {}
         stage_summaries_by_id = data.get("stage_summaries_by_id") or {}
         default_key_map = data.get("key_map", {})
 
@@ -93,6 +94,9 @@ def parse_merger_json_schema(schema_str, models_dict):
             src_id = getattr(mp, "_kitten_source_id", None)
             if src_id:
                 source_remap[src_id] = insp_m
+            st_id = getattr(mp, "_kitten_stage_id", None)
+            if st_id:
+                source_remap[st_id] = insp_m
 
         remapped_palette = []
         for entry in palette:
@@ -106,13 +110,14 @@ def parse_merger_json_schema(schema_str, models_dict):
         for insp_m in m_ids:
             mp = models_dict[insp_m]
             s_id = getattr(mp, "_kitten_stage_id", None)
-            if s_id and s_id in stage_key_maps:
+            if s_id and (s_id in stage_direct_maps or s_id in stage_key_maps):
                 s_summary = stage_summaries_by_id.get(s_id, s_id)
+                active_kmap = stage_direct_maps.get(s_id) or stage_key_maps[s_id]
                 rules.append({
                     "raw": f"Merger ({s_summary}) => {insp_m}",
                     "rhs": insp_m,
                     "palette": remapped_palette,
-                    "key_map": stage_key_maps[s_id],
+                    "key_map": active_kmap,
                     "is_kitten_json": True,
                 })
 
@@ -355,15 +360,15 @@ class ModelMergeInspector:
 
         for k_idx, k in enumerate(all_keys_list):
             if k_idx % 32 == 0 or k_idx == total_keys - 1:
-                pct = 5 + int(((k_idx + 1) / total_keys) * 75)
+                pct = 5 + int(((k_idx + 1) / total_keys) * 80)
                 if pbar is not None:
                     pbar.update_absolute(pct, 100)
                 send_kitten_progress(
                     unique_id,
                     f"Step 1/3: Scanning & Comparing ({compare_mode})",
                     f"Key {k_idx + 1}/{total_keys}",
-                    pct,
-                    100,
+                    k_idx + 1,
+                    total_keys,
                 )
 
             clean_k = strip_diffusion_prefix(k)
@@ -460,7 +465,12 @@ class ModelMergeInspector:
                 for coeff, lhs_m in lhs_pairs:
                     if abs(coeff) <= 1e-9 or lhs_m in lora_m_ids:
                         continue
-                    lhs_src_id = getattr(models_dict.get(lhs_m), "_kitten_source_id", None) or lhs_m
+                    lhs_mp = models_dict.get(lhs_m)
+                    lhs_src_id = (
+                        getattr(lhs_mp, "_kitten_stage_id", None)
+                        or getattr(lhs_mp, "_kitten_source_id", None)
+                        or lhs_m
+                    )
                     pair_key = (lhs_src_id, rhs_stage_id)
                     if pair_key in pre_diffs and k in pre_diffs[pair_key]:
                         d = pre_diffs[pair_key][k]
