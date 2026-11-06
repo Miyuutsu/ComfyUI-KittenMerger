@@ -1,9 +1,11 @@
 import json
 import os
 import re
+import time
 from datetime import datetime
 import torch
 import comfy.model_management
+import comfy.utils
 import folder_paths
 
 from .merger_node import eval_single_key_stage_recipe
@@ -20,6 +22,7 @@ from .utils import (
     natural_sort_key,
     parse_key_for_block,
     resolve_patched_tensor,
+    send_kitten_progress,
     strip_diffusion_prefix,
 )
 
@@ -234,6 +237,9 @@ class ModelMergeInspector:
                 ),
                 "model_1": ("MODEL",),
             }),
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("STRING",) + ("MODEL",) * MAX_INSPECTOR_OUTPUTS
@@ -242,13 +248,27 @@ class ModelMergeInspector:
     OUTPUT_NODE = True
     CATEGORY = "kitten_merger"
 
-    def _scan_models(self, models_dict, rules, compare_mode, change_threshold, zero_threshold, stage_recipes=None):
+    def _scan_models(
+        self,
+        models_dict,
+        rules,
+        compare_mode,
+        change_threshold,
+        zero_threshold,
+        stage_recipes=None,
+        precomputed_stats=None,
+        precomputed_pair_diffs=None,
+        unique_id=None,
+        pbar=None,
+        ):
         device = comfy.model_management.get_torch_device()
         m_ids = list(models_dict.keys())
         lora_m_ids = {m for m in m_ids if getattr(models_dict[m], "_kitten_is_lora", False)}
         virtual_m_ids = {m for m in m_ids if getattr(models_dict[m], "_kitten_is_virtual_stage", False)}
         base_m_ids = [m for m in m_ids if m not in lora_m_ids and m not in virtual_m_ids]
         recipe_by_s_id = {ps["s_id"]: ps for ps in (stage_recipes or [])}
+        pre_stats = precomputed_stats or {}
+        pre_diffs = precomputed_pair_diffs or {}
 
         raw_sds = {m: models_dict[m].model.state_dict() for m in m_ids}
 
@@ -330,17 +350,22 @@ class ModelMergeInspector:
                 ModelMergeInspector._model_stats_cache[m_sig] = {}
             model_stat_maps[m] = ModelMergeInspector._model_stats_cache[m_sig]
 
-        for m in m_ids:
-            if m in virtual_m_ids:
-                continue
-            m_sig = (get_model_signature(models_dict[m]), getattr(models_dict[m], "_kitten_is_lora", False))
-            if m_sig not in ModelMergeInspector._model_stats_cache:
-                ModelMergeInspector._model_stats_cache[m_sig] = {}
-            model_stat_maps[m] = ModelMergeInspector._model_stats_cache[m_sig]
-
         skipped_empty = {}
+        total_keys = max(1, len(all_keys_list))
 
-        for k in all_keys_list:
+        for k_idx, k in enumerate(all_keys_list):
+            if k_idx % 32 == 0 or k_idx == total_keys - 1:
+                pct = 5 + int(((k_idx + 1) / total_keys) * 75)
+                if pbar is not None:
+                    pbar.update_absolute(pct, 100)
+                send_kitten_progress(
+                    unique_id,
+                    f"Step 1/3: Scanning & Comparing ({compare_mode})",
+                    f"Key {k_idx + 1}/{total_keys}",
+                    pct,
+                    100,
+                )
+
             clean_k = strip_diffusion_prefix(k)
             _, b_idx, suffix = parse_key_for_block(k)
 
@@ -383,7 +408,17 @@ class ModelMergeInspector:
             zero_in = []
 
             for m in m_ids:
-                if m in virtual_m_ids:
+                s_id_attr = getattr(models_dict[m], "_kitten_stage_id", None) or m
+                src_id_attr = getattr(models_dict[m], "_kitten_source_id", None) or m
+                if s_id_attr in pre_stats and k in pre_stats[s_id_attr]:
+                    w, has_nan = pre_stats[s_id_attr][k]
+                    if m not in virtual_m_ids and m in model_stat_maps:
+                        model_stat_maps[m][k] = (w, has_nan)
+                elif src_id_attr in pre_stats and k in pre_stats[src_id_attr]:
+                    w, has_nan = pre_stats[src_id_attr][k]
+                    if m not in virtual_m_ids and m in model_stat_maps:
+                        model_stat_maps[m][k] = (w, has_nan)
+                elif m in virtual_m_ids:
                     gt = get_calc_tensor(m)
                     w, has_nan = inspect_tensor_stats(gt, device=device) if gt is not None else (None, False)
                 elif k in sds[m]:
@@ -410,9 +445,7 @@ class ModelMergeInspector:
             for r in rules:
                 raw_r = r["raw"]
                 rhs_m = r["rhs"]
-                t_rhs = get_calc_tensor(rhs_m)
-                if t_rhs is None or not t_rhs.is_floating_point():
-                    continue
+                rhs_stage_id = getattr(models_dict.get(rhs_m), "_kitten_stage_id", None) or rhs_m
 
                 if r.get("is_kitten_json"):
                     p_idx = r["key_map"].get(k)
@@ -427,16 +460,27 @@ class ModelMergeInspector:
                 for coeff, lhs_m in lhs_pairs:
                     if abs(coeff) <= 1e-9 or lhs_m in lora_m_ids:
                         continue
-                    t_lhs = get_calc_tensor(lhs_m)
-                    if t_lhs is not None and t_lhs.shape == t_rhs.shape:
-                        d = inspect_tensor_diff(t_lhs, t_rhs, device=device)
+                    lhs_src_id = getattr(models_dict.get(lhs_m), "_kitten_source_id", None) or lhs_m
+                    pair_key = (lhs_src_id, rhs_stage_id)
+                    if pair_key in pre_diffs and k in pre_diffs[pair_key]:
+                        d = pre_diffs[pair_key][k]
                         parent_max_diff = max(parent_max_diff, d)
                         has_parent = True
+                    else:
+                        t_rhs = get_calc_tensor(rhs_m)
+                        t_lhs = get_calc_tensor(lhs_m)
+                        if t_rhs is not None and t_lhs is not None and t_lhs.shape == t_rhs.shape:
+                            d = inspect_tensor_diff(t_lhs, t_rhs, device=device)
+                            parent_max_diff = max(parent_max_diff, d)
+                            has_parent = True
 
                 if has_parent and parent_max_diff >= change_threshold:
                     is_changed = True
 
                 if compare_mode == "verify":
+                    t_rhs = get_calc_tensor(rhs_m)
+                    if t_rhs is None or not t_rhs.is_floating_point():
+                        continue
                     expected = None
                     valid_verify = True
                     for coeff, lhs_m in lhs_pairs:
@@ -655,8 +699,12 @@ class ModelMergeInspector:
         save_to_output=False,
         filename_prefix="model_merge_diff",
         merge_schema=None,
+        unique_id=None,
         **kwargs,
     ):
+        t_start_total = time.perf_counter()
+        timings = {}
+        pbar = comfy.utils.ProgressBar(100)
         models_dict = {}
         alias_map = {}
         using_bundled_schema = False
@@ -726,9 +774,15 @@ class ModelMergeInspector:
             round(zero_threshold, 6),
         )
 
+        t_phase = time.perf_counter()
         stage_recipes = getattr(merge_schema, "_kitten_stage_recipes", None)
+        precomputed_stats = getattr(merge_schema, "_kitten_precomputed_stats", None)
+        precomputed_pair_diffs = getattr(merge_schema, "_kitten_precomputed_pair_diffs", None)
+
         if ModelMergeInspector._last_cache_sig == sig and ModelMergeInspector._last_cache_data is not None:
             data = ModelMergeInspector._last_cache_data
+            timings["Scan (Cached)"] = time.perf_counter() - t_phase
+            pbar.update_absolute(80, 100)
         else:
             data = self._scan_models(
                 models_dict,
@@ -737,9 +791,14 @@ class ModelMergeInspector:
                 change_threshold,
                 zero_threshold,
                 stage_recipes=stage_recipes,
+                precomputed_stats=precomputed_stats,
+                precomputed_pair_diffs=precomputed_pair_diffs,
+                unique_id=unique_id,
+                pbar=pbar,
             )
             ModelMergeInspector._last_cache_sig = sig
             ModelMergeInspector._last_cache_data = data
+            timings["Scan & Compare"] = time.perf_counter() - t_phase
 
         lora_m_ids = data.get("lora_m_ids", set())
         blocks_data = data["blocks_data"]
@@ -789,6 +848,9 @@ class ModelMergeInspector:
                     if muted_parents and active_parents:
                         diluted_blocks.append((b_idx, r["raw"], muted_parents, rhs_m))
 
+        t_phase = time.perf_counter()
+        if replace_zeros != "none":
+            send_kitten_progress(unique_id, "Step 2/3: Solving Zeroes", f"Mode: {replace_zeros_mode}", 85, 100)
         repaired_models, repair_logs = self._solve_zeros(
             models_dict,
             data,
@@ -797,6 +859,10 @@ class ModelMergeInspector:
             replace_zeros_from,
             zero_blocks_list,
         )
+        timings["Solve Zeroes"] = time.perf_counter() - t_phase
+        t_phase = time.perf_counter()
+        send_kitten_progress(unique_id, "Step 3/3: Formatting Report", "Building diagnostics & sections", 92, 100)
+        pbar.update_absolute(92, 100)
 
         sec_diag = ["=== DIAGNOSTICS & MERGE HEALTH ==="]
         issues_found = 0
@@ -1037,6 +1103,14 @@ class ModelMergeInspector:
             model_outputs = tuple(
                 repaired_models.get(f"m{i}", None) for i in range(1, MAX_INSPECTOR_OUTPUTS + 1)
             )
+
+        timings["Format Report"] = time.perf_counter() - t_phase
+        total_elapsed = time.perf_counter() - t_start_total
+        timing_str = " | ".join(f"{k}: {v:.2f}s" for k, v in timings.items())
+        print(f"[KittenMerger] ModelMergeInspector finished in {total_elapsed:.2f}s ({timing_str})")
+
+        pbar.update_absolute(100, 100)
+        send_kitten_progress(unique_id, "done", f"Completed in {total_elapsed:.2f}s", 100, 100)
 
         return {
             "ui": {"sections": [sections_dict], "report_text": [final_report]},

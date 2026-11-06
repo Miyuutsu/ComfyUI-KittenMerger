@@ -481,6 +481,17 @@ app.registerExtension({
                 this._displayWidget = displayWidget;
             }
 
+            this._updateProgressBanner = (phase, detail, current, total) => {
+                if (!this._displayWidget) return;
+                if (!phase || phase === "done") return;
+                const pct = Math.max(0, Math.min(100, Math.round((current / Math.max(1, total)) * 100)));
+                const barWidth = 28;
+                const filled = Math.round((pct / 100) * barWidth);
+                const bar = "█".repeat(filled) + "░".repeat(Math.max(0, barWidth - filled));
+                this._displayWidget.value = `[Model Inspector Running]\n${phase}\n${detail || ""}\n[${bar}] ${pct}%`;
+                app.graph?.setDirtyCanvas(true, false);
+            };
+
             this._cachedSections = null;
 
             for (const swName of SWITCH_NAMES) {

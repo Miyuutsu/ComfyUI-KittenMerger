@@ -1,8 +1,10 @@
 import gc
 import json
+import time
 import weakref
 import torch
 import comfy.model_management
+import comfy.utils
 
 from .loader_nodes import KittenLoRAModel
 from .utils import (
@@ -12,12 +14,14 @@ from .utils import (
     MergerSchemaPayload,
     convert_state_dict_to_tier,
     detect_block_tier,
+     get_model_signature,
+    inspect_tensor_diff,
     inspect_tensor_stats,
     materialize_patched_state_dict,
     natural_sort_key,
     parse_key_for_block,
+    send_kitten_progress,
     strip_diffusion_prefix,
-    get_model_signature,
 )
 
 MAX_MERGE_STAGES = 32
@@ -490,6 +494,10 @@ class AnimaModelMerger:
                     sch._kitten_stage_recipes.clear()
                 if hasattr(sch, "_kitten_passthrough_models"):
                     sch._kitten_passthrough_models.clear()
+                if hasattr(sch, "_kitten_precomputed_stats"):
+                    sch._kitten_precomputed_stats.clear()
+                if hasattr(sch, "_kitten_precomputed_pair_diffs"):
+                    sch._kitten_precomputed_pair_diffs.clear()
         cls._allocated_schemas.clear()
 
     @classmethod
@@ -550,6 +558,10 @@ class AnimaModelMerger:
             "optional": DynamicModelInputs({
                 "model_1": ("MODEL",),
             }),
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("STRING",) + ("MODEL",) * MAX_TOTAL_MODEL_OUTPUTS
@@ -818,6 +830,9 @@ class AnimaModelMerger:
         gc.collect()
         comfy.model_management.soft_empty_cache()
 
+        t_start_total = time.perf_counter()
+        timings = {}
+
         m_ids = list(models_dict.keys())
         device = comfy.model_management.get_torch_device()
         calc_dtype = {
@@ -917,6 +932,19 @@ class AnimaModelMerger:
             m_ids,
         )
 
+        # Check if a ModelMergeInspector is wired to merge_schema (slot 0)
+        has_downstream_inspector = False
+        if prompt and unique_id:
+            my_id_str = str(unique_id)
+            for _, node_info in prompt.items():
+                if not isinstance(node_info, dict) or node_info.get("class_type") != "ModelMergeInspector":
+                    continue
+                for _, link_val in (node_info.get("inputs") or {}).items():
+                    if isinstance(link_val, list) and len(link_val) == 2:
+                        if str(link_val[0]) == my_id_str and int(link_val[1]) == 0:
+                            has_downstream_inspector = True
+                            break
+
         # A stage is needed if it is enabled OR wired downstream, plus any parent stages it depends on
         active_stage_ids = {
             s_id for s_id in stage_ids_in_order
@@ -960,16 +988,29 @@ class AnimaModelMerger:
         if not active_m_ids:
             active_m_ids.add(m_ids[0])
 
+        t_phase = time.perf_counter()
         raw_sds = {}
         tiers_by_id = {}
         source_is_lora = {}
+        active_m_list = [m for m in m_ids if m in active_m_ids]
 
-        for m in m_ids:
+        pbar = comfy.utils.ProgressBar(100)
+        send_kitten_progress(unique_id, "Step 1/4: Resolving Inputs", f"0/{len(active_m_list)} models", 0, 100)
+
+        for idx, m in enumerate(m_ids):
             mp = models_dict[m]
             is_lora = bool(getattr(mp, "_kitten_is_lora", False))
             source_is_lora[m] = is_lora
             if m not in active_m_ids:
                 continue
+            disp_m = model_names_by_id.get(m, m)
+            send_kitten_progress(
+                unique_id,
+                "Step 1/4: Resolving Inputs",
+                f"{m} ({disp_m})",
+                int((idx / max(1, len(m_ids))) * 15),
+                100,
+            )
             if is_lora:
                 raw_sds[m] = mp.materialize_state_dict(dtype=torch.bfloat16, device=device)
             else:
@@ -977,7 +1018,10 @@ class AnimaModelMerger:
             tier, _ = detect_block_tier(raw_sds[m].keys())
             tiers_by_id[m] = tier
 
-        active_m_list = [m for m in m_ids if m in active_m_ids]
+        timings["Load/Resolve"] = time.perf_counter() - t_phase
+        pbar.update_absolute(15, 100)
+
+        t_phase = time.perf_counter()
         resolved_tier = self._determine_target_tier(target_tier, tiers_by_id, active_m_list)
 
         non_lora_ids = [m for m in active_m_list if not source_is_lora[m]]
@@ -997,8 +1041,16 @@ class AnimaModelMerger:
         aligned_sds = {}
         skipped_blocks_by_source = {}
 
-        for m in active_m_list:
+        for idx, m in enumerate(active_m_list):
             orig_tier = tiers_by_id[m]
+            if orig_tier != resolved_tier and orig_tier is not None:
+                send_kitten_progress(
+                    unique_id,
+                    "Step 2/4: Scaling Architecture",
+                    f"{m}: {orig_tier} -> {resolved_tier} blocks",
+                    15 + int((idx / max(1, len(active_m_list))) * 10),
+                    100,
+                )
             conv_sd, skipped_set = convert_state_dict_to_tier(
                 raw_sds.pop(m),
                 orig_tier,
@@ -1013,6 +1065,8 @@ class AnimaModelMerger:
             skipped_blocks_by_source[m] = skipped_set
 
         del raw_sds
+        timings["Tier Scale"] = time.perf_counter() - t_phase
+        pbar.update_absolute(25, 100)
 
         clean_to_ref_key = {}
         for k in aligned_sds[template_m_id].keys():
@@ -1041,7 +1095,21 @@ class AnimaModelMerger:
         stage_zero_fixes = {}
         stats_cache = AnimaModelMerger._source_stats_cache
 
+        # Map each base model ID to a stable cache key so swapping models never collides on "m1"
+        source_cache_keys = {
+            m: (
+                get_model_signature(models_dict[m]),
+                resolved_tier,
+                downscale_absorb,
+                upscale_fill_mode,
+                round(float(neighbor_ratio), 4),
+            )
+            for m in active_m_list
+        }
+
+        t_phase = time.perf_counter()
         prepared_stages = []
+        stages_needing_deferred_zero_fix = set()
 
         for s_id in stage_ids_in_order:
             meta = stage_meta_by_id[s_id]
@@ -1065,22 +1133,48 @@ class AnimaModelMerger:
             sources_lineage[s_id] = {}
             skipped_blocks_by_source[s_id] = set()
 
-            if st.get("fix_zeros", False) and model_a_id in aligned_sds and model_b_id in aligned_sds:
-                auto_zero_ov = compute_stage_zero_fix_overrides(
-                    model_a_id,
-                    aligned_sds[model_a_id],
-                    model_b_id,
-                    aligned_sds[model_b_id],
-                    all_target_keys,
-                    stats_cache,
-                    is_a_lora=is_a_lora,
-                    is_b_lora=is_b_lora,
-                    device=device,
-                )
-                stage_zero_fixes[s_id] = auto_zero_ov
-                runtime_zero_ov = auto_zero_ov
-            else:
-                runtime_zero_ov = None
+            runtime_zero_ov = None
+            if st.get("fix_zeros", False):
+                if model_a_id in aligned_sds and model_b_id in aligned_sds:
+                    send_kitten_progress(
+                        unique_id,
+                        "Step 2/4: Scanning Fix Zeros",
+                        f"Stage {s_id} ({model_a_id} vs {model_b_id})",
+                        28,
+                        100,
+                    )
+                    auto_zero_ov = compute_stage_zero_fix_overrides(
+                        source_cache_keys.get(model_a_id, model_a_id),
+                        aligned_sds[model_a_id],
+                        source_cache_keys.get(model_b_id, model_b_id),
+                        aligned_sds[model_b_id],
+                        all_target_keys,
+                        stats_cache,
+                        is_a_lora=is_a_lora,
+                        is_b_lora=is_b_lora,
+                        device=device,
+                    )
+                    stage_zero_fixes[s_id] = auto_zero_ov
+                    runtime_zero_ov = auto_zero_ov
+                else:
+                    # One of the inputs is a prior stage (e.g. s1); pre-scan any base model input now
+                    if model_a_id in aligned_sds:
+                        get_cached_source_stats(
+                            source_cache_keys.get(model_a_id, model_a_id),
+                            aligned_sds[model_a_id],
+                            all_target_keys,
+                            stats_cache,
+                            device=device,
+                        )
+                    if model_b_id in aligned_sds:
+                        get_cached_source_stats(
+                            source_cache_keys.get(model_b_id, model_b_id),
+                            aligned_sds[model_b_id],
+                            all_target_keys,
+                            stats_cache,
+                            device=device,
+                        )
+                    stages_needing_deferred_zero_fix.add(s_id)
 
             g_op = st.get("global_op", "ws")
             g_w = float(st.get("global_ratio", 0.5))
@@ -1125,7 +1219,41 @@ class AnimaModelMerger:
                 "runtime_zero_ov": runtime_zero_ov,
             })
 
-        for k in (all_target_keys if prepared_stages else ()):
+        timings["Fix Zeros Scan"] = time.perf_counter() - t_phase
+        pbar.update_absolute(30, 100)
+
+        # Precompute stats & parent diffs during merge if Inspector is wired downstream or deferred Fix Zeros is needed
+        precomputed_stats = {s_id: {} for s_id in enabled_in_order}
+        precomputed_pair_diffs = {}
+        stage_ids_needed_for_zero_fix = set()
+        for ps in prepared_stages:
+            if ps["s_id"] in stages_needing_deferred_zero_fix:
+                if ps["model_a_id"] not in aligned_sds:
+                    stage_ids_needed_for_zero_fix.add(ps["model_a_id"])
+                if ps["model_b_id"] not in aligned_sds:
+                    stage_ids_needed_for_zero_fix.add(ps["model_b_id"])
+
+        for m in active_m_list:
+            ck = source_cache_keys.get(m, m)
+            if ck in stats_cache:
+                precomputed_stats[m] = {k: (v, False) for k, v in stats_cache[ck]["key_norms"].items()}
+
+        t_phase = time.perf_counter()
+        total_keys = max(1, len(all_target_keys))
+        stage_label_list = ", ".join(ps["s_id"] for ps in prepared_stages)
+
+        for k_idx, k in enumerate(all_target_keys if prepared_stages else ()):
+            if k_idx % 32 == 0 or k_idx == total_keys - 1:
+                pct = 30 + int(((k_idx + 1) / total_keys) * 55)
+                pbar.update_absolute(pct, 100)
+                send_kitten_progress(
+                    unique_id,
+                    f"Step 3/4: Merging ({stage_label_list})",
+                    f"Key {k_idx + 1}/{total_keys}",
+                    pct,
+                    100,
+                )
+
             clean_k = strip_diffusion_prefix(k)
             _, b_idx, _ = parse_key_for_block(k)
 
@@ -1153,11 +1281,39 @@ class AnimaModelMerger:
                 has_model_c = ps["has_model_c"]
                 is_a_lora = ps["is_a_lora"]
                 is_b_lora = ps["is_b_lora"]
-                is_c_lora = ps["is_c_lora"]
                 both_ab_lora = ps["both_ab_lora"]
                 out_stage_is_lora = ps["out_stage_is_lora"]
                 runtime_zero_ov = ps["runtime_zero_ov"]
                 should_store_cpu = s_id in materialized_stage_ids
+                need_stage_norm = has_downstream_inspector or (s_id in stage_ids_needed_for_zero_fix)
+
+                # Handle deferred per-key Fix Zeros when an input is a prior stage (e.g. s1)
+                if s_id in stages_needing_deferred_zero_fix:
+                    a_stat = precomputed_stats.get(model_a_id, {}).get(k)
+                    if a_stat is None:
+                        ck_a = source_cache_keys.get(model_a_id, model_a_id)
+                        a_norm = stats_cache.get(ck_a, {}).get("key_norms", {}).get(k, 0.0)
+                    else:
+                        a_norm = a_stat[0] or 0.0
+
+                    b_stat = precomputed_stats.get(model_b_id, {}).get(k)
+                    if b_stat is None:
+                        ck_b = source_cache_keys.get(model_b_id, model_b_id)
+                        b_norm = stats_cache.get(ck_b, {}).get("key_norms", {}).get(k, 0.0)
+                    else:
+                        b_norm = b_stat[0] or 0.0
+
+                    a_zero = a_norm <= ZERO_FIX_TOLERANCE
+                    b_zero = b_norm <= ZERO_FIX_TOLERANCE
+                    if b_zero and not a_zero:
+                        runtime_zero_ov = {clean_k: 1.0}
+                        stage_zero_fixes.setdefault(s_id, {})[clean_k] = 1.0
+                    elif a_zero and not b_zero:
+                        runtime_zero_ov = {clean_k: 0.0}
+                        stage_zero_fixes.setdefault(s_id, {})[clean_k] = 0.0
+                    else:
+                        runtime_zero_ov = None
+                    ps["runtime_zero_ov"] = runtime_zero_ov
 
                 lin_a = sources_lineage[model_a_id].get(k, {})
                 lin_b = sources_lineage[model_b_id].get(k, {})
@@ -1191,6 +1347,13 @@ class AnimaModelMerger:
                         if should_store_cpu:
                             sources_sd[s_id][k] = ref_a
                         sources_lineage[s_id][k] = dict(lin_a)
+                        if need_stage_norm:
+                            if model_a_id in precomputed_stats and k in precomputed_stats[model_a_id]:
+                                precomputed_stats[s_id][k] = precomputed_stats[model_a_id][k]
+                            else:
+                                precomputed_stats[s_id][k] = inspect_tensor_stats(ref_a, device=device)
+                        if has_downstream_inspector:
+                            precomputed_pair_diffs.setdefault((model_a_id, s_id), {})[k] = 0.0
                         continue
                     if abs(w) <= 1e-7 and ref_b is not None:
                         cpu_exact_refs[s_id] = ref_b
@@ -1199,6 +1362,13 @@ class AnimaModelMerger:
                         if should_store_cpu:
                             sources_sd[s_id][k] = ref_b
                         sources_lineage[s_id][k] = dict(lin_b)
+                        if need_stage_norm:
+                            if model_b_id in precomputed_stats and k in precomputed_stats[model_b_id]:
+                                precomputed_stats[s_id][k] = precomputed_stats[model_b_id][k]
+                            else:
+                                precomputed_stats[s_id][k] = inspect_tensor_stats(ref_b, device=device)
+                        if has_downstream_inspector:
+                            precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = 0.0
                         continue
 
                 merged_gpu, is_exact_a, is_exact_b = eval_single_key_stage_recipe(
@@ -1209,6 +1379,26 @@ class AnimaModelMerger:
 
                 gpu_calc_tensors[s_id] = merged_gpu
                 store_dtype = calc_dtype if not out_stage_is_lora else torch.bfloat16
+
+                if need_stage_norm:
+                    precomputed_stats[s_id][k] = inspect_tensor_stats(merged_gpu, device=device)
+
+                if has_downstream_inspector:
+                    for src_m in active_m_list:
+                        if src_m in gpu_calc_tensors and src_m not in precomputed_stats.get(src_m, {}):
+                            precomputed_stats.setdefault(src_m, {})[k] = inspect_tensor_stats(
+                                gpu_calc_tensors[src_m], device=device
+                            )
+                    ta_g = gpu_calc_tensors.get(model_a_id)
+                    if ta_g is not None and ta_g.shape == merged_gpu.shape and not is_a_lora:
+                        precomputed_pair_diffs.setdefault((model_a_id, s_id), {})[k] = (
+                            0.0 if is_exact_a else inspect_tensor_diff(ta_g, merged_gpu, device=device)
+                        )
+                    tb_g = gpu_calc_tensors.get(model_b_id)
+                    if tb_g is not None and tb_g.shape == merged_gpu.shape and not is_b_lora:
+                        precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = (
+                            0.0 if is_exact_b else inspect_tensor_diff(tb_g, merged_gpu, device=device)
+                        )
 
                 if is_exact_a and ref_a is not None and ref_a.dtype == store_dtype:
                     cpu_exact_refs[s_id] = ref_a
@@ -1247,8 +1437,24 @@ class AnimaModelMerger:
                 elif op in ("cosine_a", "cosine_b"):
                     sources_lineage[s_id][k] = combine_lineage_dicts([(w, lin_a), (1.0 - w, lin_b)])
 
+                # Compute root-parent diffs for multi-stage chains so Inspector lineage needs 0 GPU calls
+                if has_downstream_inspector:
+                    for root_m in sources_lineage[s_id].get(k, {}):
+                        if (root_m, s_id) not in precomputed_pair_diffs or k not in precomputed_pair_diffs[(root_m, s_id)]:
+                            if not source_is_lora.get(root_m, False):
+                                tr_g = get_calc_tensor(root_m)
+                                if tr_g is not None and tr_g.shape == merged_gpu.shape:
+                                    precomputed_pair_diffs.setdefault((root_m, s_id), {})[k] = inspect_tensor_diff(
+                                        tr_g, merged_gpu, device=device
+                                    )
+
             gpu_calc_tensors.clear()
             cpu_exact_refs.clear()
+
+        timings[f"Merge ({len(prepared_stages)} st)"] = time.perf_counter() - t_phase
+        t_phase = time.perf_counter()
+        send_kitten_progress(unique_id, "Step 4/4: Building Outputs", "Wrapping ModelPatchers", 90, 100)
+        pbar.update_absolute(90, 100)
 
         passthrough_mps = {}
         for i in range(1, json_model_output_count + 1):
@@ -1374,6 +1580,8 @@ class AnimaModelMerger:
             is_lora_map=source_is_lora,
             output_slot_order=output_slot_order,
             passthrough_models=all_passthrough_and_stages,
+            precomputed_stats=precomputed_stats,
+            precomputed_pair_diffs=precomputed_pair_diffs,
         )
         AnimaModelMerger._allocated_schemas.append(weakref.ref(schema_payload))
 
@@ -1385,6 +1593,14 @@ class AnimaModelMerger:
 
         while len(ordered_model_outputs) < MAX_TOTAL_MODEL_OUTPUTS:
             ordered_model_outputs.append(None)
+
+        timings["Build Patchers"] = time.perf_counter() - t_phase
+        total_elapsed = time.perf_counter() - t_start_total
+        timing_str = " | ".join(f"{k}: {v:.2f}s" for k, v in timings.items())
+        print(f"[KittenMerger] AnimaModelMerger finished in {total_elapsed:.2f}s ({timing_str})")
+
+        pbar.update_absolute(100, 100)
+        send_kitten_progress(unique_id, "done", f"Completed in {total_elapsed:.2f}s", 100, 100)
 
         ret = {
             "ui": {

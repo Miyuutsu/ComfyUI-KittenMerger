@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 const SUB_LAYERS = [
     "adaln_modulation_self_attn",
@@ -669,6 +670,16 @@ function ensureConfiguredSlotsExist(node, info) {
 
 app.registerExtension({
     name: "KittenMerger.AnimaMergerUI",
+    setup() {
+        api.addEventListener("kitten_merger_progress", (ev) => {
+            const d = ev.detail;
+            if (!d || !d.node_id) return;
+            const node = app.graph?.getNodeById(Number(d.node_id)) || app.graph?.getNodeById(d.node_id);
+            if (node && typeof node._updateProgressBanner === "function") {
+                node._updateProgressBanner(d.phase, d.detail, d.current, d.total);
+            }
+        });
+    },
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
         if (nodeData.name !== "AnimaModelMerger") {
             return;
@@ -1128,6 +1139,54 @@ app.registerExtension({
                 flex-shrink: 0;
             `;
 
+            const statusBanner = document.createElement("div");
+            statusBanner.style.cssText = `
+                display: none;
+                flex-direction: column;
+                gap: 3px;
+                padding: 4px 8px;
+                background: #172a3a;
+                border-bottom: 1px solid #2980b9;
+                color: #5dade2;
+                font-size: 11px;
+                flex-shrink: 0;
+            `;
+            const statusTextRow = document.createElement("div");
+            statusTextRow.style.cssText = "display: flex; justify-content: space-between; align-items: center;";
+            const statusPhaseSpan = document.createElement("span");
+            statusPhaseSpan.style.fontWeight = "bold";
+            const statusDetailSpan = document.createElement("span");
+            statusDetailSpan.style.color = "#aed6f1";
+            statusTextRow.appendChild(statusPhaseSpan);
+            statusTextRow.appendChild(statusDetailSpan);
+
+            const statusTrack = document.createElement("div");
+            statusTrack.style.cssText = "width: 100%; height: 4px; background: #0e1a24; border-radius: 2px; overflow: hidden;";
+            const statusFill = document.createElement("div");
+            statusFill.style.cssText = "width: 0%; height: 100%; background: #3498db; transition: width 0.08s linear;";
+            statusTrack.appendChild(statusFill);
+            statusBanner.appendChild(statusTextRow);
+            statusBanner.appendChild(statusTrack);
+
+            this._updateProgressBanner = (phase, detail, current, total) => {
+                if (!phase || phase === "done") {
+                    statusPhaseSpan.textContent = "Merge Complete";
+                    statusDetailSpan.textContent = detail || "100%";
+                    statusFill.style.width = "100%";
+                    statusFill.style.background = "#2ecc71";
+                    setTimeout(() => {
+                        statusBanner.style.display = "none";
+                    }, 1200);
+                    return;
+                }
+                statusBanner.style.display = "flex";
+                statusFill.style.background = "#3498db";
+                const pct = Math.max(0, Math.min(100, Math.round((current / Math.max(1, total)) * 100)));
+                statusPhaseSpan.textContent = phase;
+                statusDetailSpan.textContent = `${detail ? detail + " — " : ""}${pct}%`;
+                statusFill.style.width = `${pct}%`;
+            };
+
             const treeScroll = document.createElement("div");
             treeScroll.style.cssText = `
                 flex: 1;
@@ -1153,6 +1212,7 @@ app.registerExtension({
             `;
 
             container.appendChild(topBar);
+            container.appendChild(statusBanner);
             container.appendChild(treeScroll);
             container.appendChild(modalOverlay);
 

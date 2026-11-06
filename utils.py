@@ -71,6 +71,27 @@ SUBSPACE_PROJECTION_TRIPLETS = (
 )
 
 
+def send_kitten_progress(node_id, phase, detail="", current=0, total=100):
+    if not node_id:
+        return
+    try:
+        from server import PromptServer
+
+        if getattr(PromptServer, "instance", None) is not None:
+            PromptServer.instance.send_sync(
+                "kitten_merger_progress",
+                {
+                    "node_id": str(node_id),
+                    "phase": phase,
+                    "detail": detail,
+                    "current": int(current),
+                    "total": int(max(1, total)),
+                },
+            )
+    except Exception:
+        pass
+
+
 class MergerSchemaPayload(str):
     """
     String subclass for merge_schema that behaves like a normal JSON string for any text node,
@@ -84,6 +105,8 @@ class MergerSchemaPayload(str):
         is_lora_map=None,
         output_slot_order=None,
         passthrough_models=None,
+        precomputed_stats=None,
+        precomputed_pair_diffs=None,
     ):
         obj = super().__new__(cls, content)
         obj._kitten_bundled_models = bundled_models or []
@@ -91,6 +114,8 @@ class MergerSchemaPayload(str):
         obj._kitten_is_lora_map = is_lora_map or {}
         obj._kitten_output_slot_order = output_slot_order or []
         obj._kitten_passthrough_models = passthrough_models or {}
+        obj._kitten_precomputed_stats = precomputed_stats or {}
+        obj._kitten_precomputed_pair_diffs = precomputed_pair_diffs or {}
         return obj
 
     def __deepcopy__(self, memo):
