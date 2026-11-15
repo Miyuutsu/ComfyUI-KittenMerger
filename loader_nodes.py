@@ -253,6 +253,9 @@ def materialize_single_lora_entry(patch_entry, strength, dtype, device):
         return None
 
     if isinstance(patch_entry, dict):
+        strength = float(strength) * float(patch_entry.get("scale", 1.0))
+        if abs(strength) <= 1e-9:
+            return None
         if "diff" in patch_entry and patch_entry["diff"] is not None:
             return patch_entry["diff"].to(device=device, dtype=dtype) * float(strength)
         up = patch_entry.get("up")

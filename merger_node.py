@@ -760,7 +760,7 @@ class AnimaModelMerger:
         lora_strength=1.0,
     ):
         if template_mp is None or getattr(template_mp, "_kitten_is_lora", False):
-            if lora_entries is not None and not merged_flag:
+            if lora_entries is not None and not target_sd:
                 lora_out = KittenLoRAModel(
                     lora_entries=lora_entries,
                     strength=lora_strength,
@@ -1229,6 +1229,16 @@ class AnimaModelMerger:
             if s_id not in active_stage_ids:
                 continue
 
+            can_preserve_lowrank = (
+                out_stage_is_lora
+                and model_a_id == model_b_id
+                and model_a_id in aligned_lora_entries
+                and (not has_model_c or model_c_id == model_a_id)
+            )
+            if can_preserve_lowrank:
+                aligned_lora_entries[s_id] = {}
+                lora_strengths[s_id] = lora_strengths.get(model_a_id, 1.0)
+
             sources_sd[s_id] = {}
             sources_lineage[s_id] = {}
             direct_stage_lineage[s_id] = {}
@@ -1323,6 +1333,7 @@ class AnimaModelMerger:
                 "is_c_lora": is_c_lora,
                 "both_ab_lora": both_ab_lora,
                 "out_stage_is_lora": out_stage_is_lora,
+                "can_preserve_lowrank": can_preserve_lowrank,
                 "runtime_zero_ov": runtime_zero_ov,
             })
 
@@ -1550,6 +1561,28 @@ class AnimaModelMerger:
                             if has_downstream_inspector:
                                 precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = 0.0
                             continue
+                    if ps.get("can_preserve_lowrank") and not need_stage_norm and not has_downstream_inspector:
+                        src_entry = aligned_lora_entries[model_a_id].get(k)
+                        if src_entry is None:
+                            continue
+                        if op == "ws":
+                            scale_factor = 1.0
+                        elif op == "add":
+                            scale_factor = 1.0 + float(w)
+                        elif op == "sub":
+                            scale_factor = 1.0 - float(w)
+                        elif op == "add_diff":
+                            scale_factor = 1.0 if has_model_c else (1.0 + float(w))
+                        else:
+                            scale_factor = 1.0
+                        new_scale = float(src_entry.get("scale", 1.0)) * scale_factor
+                        if abs(new_scale) > 1e-7:
+                            new_entry = dict(src_entry)
+                            new_entry["scale"] = new_scale
+                            aligned_lora_entries[s_id][k] = new_entry
+                            sources_lineage[s_id][k] = combine_lineage_dicts([(scale_factor, lin_a)])
+                            direct_stage_lineage[s_id][k] = {model_a_id: round(scale_factor, 6)}
+                        continue
 
                     merged_gpu, is_exact_a, is_exact_b = eval_single_key_stage_recipe(
                         ps, k, clean_k, b_idx, get_calc_tensor, skipped_blocks_by_source
@@ -1691,7 +1724,7 @@ class AnimaModelMerger:
             if s_id not in active_stage_ids:
                 stage_mps[s_id] = None
                 virtual_stage_mps[s_id] = None
-            elif s_id in materialized_stage_ids and stage_sd:
+            elif s_id in materialized_stage_ids and (stage_sd or s_id in aligned_lora_entries):
                 stage_template = None if source_is_lora.get(s_id, False) else template_mp
                 mp_out = self._build_model_patcher_from_sd(
                     stage_sd,
@@ -1699,6 +1732,8 @@ class AnimaModelMerger:
                     merged_flag=True,
                     stage_id=s_id,
                     display_name=disp_name,
+                    lora_entries=aligned_lora_entries.get(s_id),
+                    lora_strength=lora_strengths.get(s_id, 1.0),
                 )
                 stage_mps[s_id] = mp_out
                 virtual_stage_mps[s_id] = mp_out

@@ -88,7 +88,15 @@ def _decompose_loha(delta_f, rank, iterations=3):
     return w1_a, w1_b, w2_a, w2_b, eff_rank
 
 
-def _decompose_delta_matrix(delta_tensor, lora_format, rank, lokr_factor, out_dtype, device):
+def _decompose_delta_matrix(
+    delta_tensor,
+    lora_format,
+    rank,
+    lokr_factor,
+    out_dtype,
+    device,
+    clamp_lora=False,
+):
     if delta_tensor is None or not delta_tensor.is_floating_point():
         return {}
 
@@ -101,16 +109,17 @@ def _decompose_delta_matrix(delta_tensor, lora_format, rank, lokr_factor, out_dt
         return {}
 
     m, n = delta_f.shape
-    m1 = _get_kronecker_factor(m, lokr_factor)
-    n1 = _get_kronecker_factor(n, lokr_factor)
-    m2 = m // m1
-    n2 = n // n1
-
-    rearranged = delta_f.reshape(m1, m2, n1, n2).permute(0, 2, 1, 3).reshape(m1 * n1, m2 * n2)
-    u_k, s_k, vh_k = torch.linalg.svd(rearranged, full_matrices=False)
-    kron_principal_energy = s_k[0].item()
 
     if lora_format == "lokr":
+        m1 = _get_kronecker_factor(m, lokr_factor)
+        n1 = _get_kronecker_factor(n, lokr_factor)
+        m2 = m // m1
+        n2 = n // n1
+
+        rearranged = delta_f.reshape(m1, m2, n1, n2).permute(0, 2, 1, 3).reshape(m1 * n1, m2 * n2)
+        u_k, s_k, vh_k = torch.linalg.svd(rearranged, full_matrices=False)
+        kron_principal_energy = s_k[0].item()
+
         s0_sqrt = math.sqrt(max(kron_principal_energy, 1e-12))
         w1 = (u_k[:, 0] * s0_sqrt).reshape(m1, n1)
         w2_full = (vh_k[0, :] * s0_sqrt).reshape(m2, n2)
@@ -143,10 +152,20 @@ def _decompose_delta_matrix(delta_tensor, lora_format, rank, lokr_factor, out_dt
     eff_rank = min(rank, m, n)
     u, s, vh = torch.linalg.svd(delta_f, full_matrices=False)
     s_clean = _compute_gavish_donoho_svht(s, m, n)[:eff_rank]
-    svd_norm = torch.linalg.norm(s_clean).item()
-    if svd_norm > kron_principal_energy and svd_norm > 1e-8:
-        target_svd_norm = 0.65 * kron_principal_energy + 0.35 * svd_norm
-        s_clean = s_clean * (target_svd_norm / svd_norm)
+
+    if clamp_lora:
+        m1 = _get_kronecker_factor(m, lokr_factor)
+        n1 = _get_kronecker_factor(n, lokr_factor)
+        m2 = m // m1
+        n2 = n // n1
+        rearranged = delta_f.reshape(m1, m2, n1, n2).permute(0, 2, 1, 3).reshape(m1 * n1, m2 * n2)
+        _, s_k, _ = torch.linalg.svd(rearranged, full_matrices=False)
+        kron_principal_energy = s_k[0].item()
+
+        svd_norm = torch.linalg.norm(s_clean).item()
+        if svd_norm > kron_principal_energy and svd_norm > 1e-8:
+            target_svd_norm = 0.65 * kron_principal_energy + 0.35 * svd_norm
+            s_clean = s_clean * (target_svd_norm / svd_norm)
 
     s_sqrt = torch.sqrt(torch.clamp(s_clean, min=1e-12))
     lora_up = u[:, :eff_rank] * s_sqrt.unsqueeze(0)
@@ -336,6 +355,13 @@ class AnimaModelSaver:
                         "tooltip": "Kronecker factor when lora_format is 'lokr'.",
                     },
                 ),
+                "clamp_lora": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "When enabled on lora (SVD), runs an extra Kronecker SVD pass per layer to clamp singular value energy. Default off for 2x faster SVD saving.",
+                    },
+                ),
             },
             "optional": DynamicUniversalInputs({
                 "merge_schema": (
@@ -360,7 +386,18 @@ class AnimaModelSaver:
     OUTPUT_NODE = True
     CATEGORY = "kitten_merger/savers"
 
-    def _extract_lora_sd(self, raw_obj, forced_dtype, lora_format, lora_rank, lokr_factor, device, unique_id=None, pbar=None):
+    def _extract_lora_sd(
+        self,
+        raw_obj,
+        forced_dtype,
+        lora_format,
+        lora_rank,
+        lokr_factor,
+        clamp_lora,
+        device,
+        unique_id=None,
+        pbar=None,
+    ):
         out_dtype = forced_dtype
         if out_dtype is None:
             if raw_obj._precomputed_sd:
@@ -369,28 +406,38 @@ class AnimaModelSaver:
             else:
                 out_dtype = torch.bfloat16
 
-        # Fast path: unmerged standalone LoRA with existing low-rank (up, down) tensors when saving as standard lora (SVD)
+        # Fast path: unmerged or single-LoRA-scaled standalone LoRA with existing low-rank (up, down) tensors
         if (
             raw_obj._precomputed_sd is None
             and raw_obj.lora_entries
             and lora_format == "lora (SVD)"
         ):
             out_sd = {}
-            strength = float(getattr(raw_obj, "strength", 1.0))
+            base_strength = float(getattr(raw_obj, "strength", 1.0))
             for k, entry in raw_obj.lora_entries.items():
                 if not isinstance(entry, dict):
                     continue
+                entry_scale = float(entry.get("scale", 1.0))
+                eff_strength = base_strength * entry_scale
+                if abs(eff_strength) <= 1e-7:
+                    continue
                 prefix = _normalize_kohya_lora_prefix(k)
                 if "up" in entry and "down" in entry and entry["up"] is not None and entry["down"] is not None:
-                    up_t = entry["up"].detach().to(device="cpu", dtype=out_dtype)
+                    up_t = entry["up"].detach()
                     down_t = entry["down"].detach().to(device="cpu", dtype=out_dtype)
                     rank = down_t.shape[0]
-                    alpha = float(entry.get("alpha") if entry.get("alpha") is not None else rank) * strength
+                    raw_alpha = float(entry.get("alpha") if entry.get("alpha") is not None else rank)
+                    if eff_strength < 0.0:
+                        up_t = (-up_t.float()).to(device="cpu", dtype=out_dtype)
+                        alpha = raw_alpha * abs(eff_strength)
+                    else:
+                        up_t = up_t.to(device="cpu", dtype=out_dtype)
+                        alpha = raw_alpha * eff_strength
                     out_sd[f"{prefix}.lora_up.weight"] = up_t.contiguous()
                     out_sd[f"{prefix}.lora_down.weight"] = down_t.contiguous()
                     out_sd[f"{prefix}.alpha"] = torch.tensor(float(alpha), dtype=torch.float32)
                 elif "diff" in entry and entry["diff"] is not None:
-                    diff_t = (entry["diff"].detach().float() * strength).to(dtype=out_dtype).contiguous().cpu()
+                    diff_t = (entry["diff"].detach().float() * eff_strength).to(dtype=out_dtype).contiguous().cpu()
                     out_sd[f"{prefix}.diff"] = diff_t
             if out_sd:
                 return out_sd
@@ -422,6 +469,7 @@ class AnimaModelSaver:
                 lokr_factor=int(lokr_factor),
                 out_dtype=out_dtype,
                 device=device,
+                clamp_lora=bool(clamp_lora),
             )
             for sfx, tensor in layer_dict.items():
                 out_sd[f"{prefix}.{sfx}"] = tensor
@@ -440,6 +488,7 @@ class AnimaModelSaver:
         lora_format,
         lora_rank,
         lokr_factor,
+        clamp_lora,
         device,
         unique_id=None,
         pbar=None,
@@ -451,6 +500,7 @@ class AnimaModelSaver:
                 lora_format=lora_format,
                 lora_rank=lora_rank,
                 lokr_factor=lokr_factor,
+                clamp_lora=clamp_lora,
                 device=device,
                 unique_id=unique_id,
                 pbar=pbar,
@@ -576,6 +626,7 @@ class AnimaModelSaver:
         lora_format="lora (SVD)",
         lora_rank=32,
         lokr_factor=8,
+        clamp_lora=False,
         merge_schema=None,
         prompt=None,
         extra_pnginfo=None,
@@ -639,6 +690,7 @@ class AnimaModelSaver:
                     lora_format=lora_format,
                     lora_rank=lora_rank,
                     lokr_factor=lokr_factor,
+                    clamp_lora=clamp_lora,
                     device=device,
                     unique_id=unique_id,
                     pbar=pbar,
@@ -695,6 +747,7 @@ class AnimaModelSaver:
                         lora_format=lora_format,
                         lora_rank=lora_rank,
                         lokr_factor=lokr_factor,
+                        clamp_lora=clamp_lora,
                         device=device,
                         unique_id=unique_id,
                         pbar=pbar,
@@ -733,6 +786,7 @@ class AnimaModelSaver:
                     lora_format=lora_format,
                     lora_rank=lora_rank,
                     lokr_factor=lokr_factor,
+                    clamp_lora=clamp_lora,
                     device=device,
                     unique_id=unique_id,
                     pbar=pbar,
