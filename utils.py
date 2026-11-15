@@ -137,6 +137,30 @@ class DynamicModelInputs(dict):
         raise KeyError(key)
 
 
+class WildcardType(str):
+    """Universal wildcard type '*' that matches any ComfyUI socket type."""
+    def __ne__(self, __value: object) -> bool:
+        return False
+
+
+ANY_TYPE = WildcardType("*")
+
+
+class DynamicUniversalInputs(dict):
+    """Allows ComfyUI's validator to accept dynamically created input_1..input_N universal inputs."""
+    def __contains__(self, key):
+        if super().__contains__(key):
+            return True
+        return isinstance(key, str) and bool(re.match(r"^input_\d+$", key))
+
+    def __getitem__(self, key):
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        if isinstance(key, str) and re.match(r"^input_\d+$", key):
+            return (ANY_TYPE,)
+        raise KeyError(key)
+
+
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", s)]
 
@@ -181,12 +205,23 @@ def detect_block_tier(keys):
 
 
 def resolve_patched_tensor(model_patcher, base_sd, key, device=None):
-    if model_patcher is None or key not in base_sd:
+    if model_patcher is None:
         return None
 
+    if getattr(model_patcher, "_kitten_is_lora", False) and hasattr(model_patcher, "materialize_key"):
+        target_dev = device if device is not None else "cpu"
+        forced_dtype = getattr(model_patcher, "_kitten_forced_dtype", None) or torch.float32
+        return model_patcher.materialize_key(key, dtype=forced_dtype, device=target_dev)
+
+    if key not in base_sd:
+        return None
+
+    forced_dtype = getattr(model_patcher, "_kitten_forced_dtype", None)
     weight = base_sd[key]
     patches = getattr(model_patcher, "patches", {})
     if key not in patches:
+        if forced_dtype is not None and weight.is_floating_point() and weight.dtype != forced_dtype:
+            return weight.detach().to(dtype=forced_dtype)
         return weight
 
     patch_list = patches[key]
@@ -201,17 +236,23 @@ def resolve_patched_tensor(model_patcher, base_sd, key, device=None):
             and len(p[1]) >= 2
             and p[1][0] == "diff"
         ):
-            return p[1][1][0]
+            diff_t = p[1][1][0]
+            if forced_dtype is not None and diff_t.is_floating_point() and diff_t.dtype != forced_dtype:
+                return diff_t.detach().to(dtype=forced_dtype)
+            return diff_t
 
     target_dev = device if device is not None else weight.device
+    calc_dt = torch.float64 if forced_dtype == torch.float64 else torch.float32
     try:
-        w_clone = weight.detach().to(device=target_dev, dtype=torch.float32).clone()
+        w_clone = weight.detach().to(device=target_dev, dtype=calc_dt).clone()
         if hasattr(comfy.lora, "calculate_weight"):
-            patched = comfy.lora.calculate_weight(patch_list, w_clone, key, intermediate_dtype=torch.float32)
+            patched = comfy.lora.calculate_weight(patch_list, w_clone, key, intermediate_dtype=calc_dt)
         elif hasattr(model_patcher, "calculate_weight"):
             patched = model_patcher.calculate_weight(patch_list, w_clone, key)
         else:
             patched = w_clone
+        if forced_dtype is not None and patched.is_floating_point():
+            patched = patched.to(dtype=forced_dtype)
         return patched
     except Exception:
         return weight
@@ -220,25 +261,31 @@ def resolve_patched_tensor(model_patcher, base_sd, key, device=None):
 def materialize_patched_state_dict(model_patcher, device=None):
     """
     Returns a dict of resolved tensors (on CPU) for a ModelPatcher.
-    Unpatched keys reference the underlying tensor directly without copying;
-    patched keys are cast back to the base tensor's native dtype (e.g. bf16) on CPU.
+    Preserves forced or merged stage precision (e.g. fp32 / fp64) when present.
     """
     base_sd = model_patcher.model.state_dict()
     patches = getattr(model_patcher, "patches", {})
-    if not patches:
+    forced_dtype = getattr(model_patcher, "_kitten_forced_dtype", None)
+    preserve_patch_dtype = bool(getattr(model_patcher, "_kitten_merged", False)) or (forced_dtype is not None)
+
+    if not patches and forced_dtype is None:
         return dict(base_sd)
 
     out = {}
     for k, base_t in base_sd.items():
         if k not in patches:
-            out[k] = base_t
+            if forced_dtype is not None and base_t.is_floating_point() and base_t.dtype != forced_dtype:
+                out[k] = base_t.detach().to(device="cpu", dtype=forced_dtype).contiguous()
+            else:
+                out[k] = base_t
         else:
             t = resolve_patched_tensor(model_patcher, base_sd, k, device=device)
             if t is not None:
-                if t.device.type == "cpu" and t.dtype == base_t.dtype:
+                target_dt = forced_dtype or (t.dtype if preserve_patch_dtype else base_t.dtype)
+                if t.device.type == "cpu" and t.dtype == target_dt:
                     out[k] = t
                 else:
-                    out[k] = t.detach().to(device="cpu", dtype=base_t.dtype).contiguous()
+                    out[k] = t.detach().to(device="cpu", dtype=target_dt).contiguous()
     return out
 
 
@@ -695,3 +742,52 @@ def convert_state_dict_to_tier(
         )
 
     return sd, skipped
+
+def _remap_lora_entries_single_stage(lora_entries, manifest, is_downscale):
+    source_to_target = build_source_to_target_map(manifest)
+    target_to_source = {v: k for k, v in source_to_target.items()}
+    insertion_positions = set(
+        manifest.get("insertion_positions", [int(k) for k in manifest.get("inserted_to_source", {})])
+    )
+
+    out_entries = {}
+    for k, entry in lora_entries.items():
+        prefix, b_idx, suffix = parse_key_for_block(k)
+        if b_idx is None:
+            out_entries[k] = entry
+            continue
+        if is_downscale:
+            if b_idx in insertion_positions or b_idx not in target_to_source:
+                continue
+            new_idx = target_to_source[b_idx]
+            out_entries[f"{prefix}{new_idx}{suffix}"] = entry
+        else:
+            if b_idx not in source_to_target:
+                continue
+            new_idx = source_to_target[b_idx]
+            out_entries[f"{prefix}{new_idx}{suffix}"] = entry
+    return out_entries
+
+
+def convert_lora_entries_to_tier(lora_entries, current_tier, target_tier, upscale_fill_mode="skip_inserted"):
+    if current_tier == target_tier or current_tier is None:
+        return dict(lora_entries), set()
+
+    entries = dict(lora_entries)
+    skipped = set()
+
+    if current_tier > target_tier:
+        if current_tier == 52 and target_tier in (40, 28):
+            entries = _remap_lora_entries_single_stage(entries, MANIFEST_40_TO_52, is_downscale=True)
+            current_tier = 40
+        if current_tier == 40 and target_tier == 28:
+            entries = _remap_lora_entries_single_stage(entries, MANIFEST_28_TO_40, is_downscale=True)
+            current_tier = 28
+        return entries, skipped
+
+    if current_tier == 28 and target_tier == 40:
+        entries = _remap_lora_entries_single_stage(entries, MANIFEST_28_TO_40, is_downscale=False)
+        if upscale_fill_mode == "skip_inserted":
+            skipped = set(MANIFEST_28_TO_40["insertion_positions"])
+
+    return entries, skipped

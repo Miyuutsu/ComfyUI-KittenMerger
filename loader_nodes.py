@@ -353,6 +353,24 @@ class KittenLoRAModel:
             self._cached_fp32_sd = self.materialize_state_dict(dtype=torch.float32, device=device)
         return self._cached_fp32_sd
 
+    def get_key_set(self):
+        if self._precomputed_sd is not None:
+            return set(self._precomputed_sd.keys())
+        return set(self.lora_entries.keys())
+
+    def materialize_key(self, key, dtype=torch.float32, device=None):
+        forced_dt = getattr(self, "_kitten_forced_dtype", None) or dtype
+        target_dev = device if device is not None else comfy.model_management.get_torch_device()
+        if self._precomputed_sd is not None:
+            t = self._precomputed_sd.get(key)
+            if t is None:
+                return None
+            return t.to(device=target_dev, dtype=forced_dt)
+        entry = self.lora_entries.get(key)
+        if entry is None:
+            return None
+        return materialize_single_lora_entry(entry, self.strength, dtype=forced_dt, device=target_dev)
+
     def materialize_state_dict(self, dtype=torch.float32, device=None):
         if self._precomputed_sd is not None:
             return {

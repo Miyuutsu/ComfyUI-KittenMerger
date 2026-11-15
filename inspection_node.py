@@ -275,7 +275,13 @@ class ModelMergeInspector:
         pre_stats = precomputed_stats or {}
         pre_diffs = precomputed_pair_diffs or {}
 
-        raw_sds = {m: models_dict[m].model.state_dict() for m in m_ids}
+        raw_sds = {}
+        for m in m_ids:
+            mp = models_dict[m]
+            if m in lora_m_ids and hasattr(mp, "get_key_set"):
+                raw_sds[m] = {k: None for k in mp.get_key_set()}
+            else:
+                raw_sds[m] = mp.model.state_dict()
 
         clean_to_ref_key = {}
         ref_pool = base_m_ids if base_m_ids else m_ids
@@ -614,7 +620,14 @@ class ModelMergeInspector:
             }, []
 
         device = comfy.model_management.get_torch_device()
-        sds = {m: models_dict[m].model.state_dict() for m in m_ids}
+        sds = {
+            m: (
+                {}
+                if (m in lora_m_ids or getattr(models_dict[m], "_kitten_is_virtual_stage", False))
+                else models_dict[m].model.state_dict()
+            )
+            for m in m_ids
+        }
         repaired_models = {}
         repair_logs = []
 
