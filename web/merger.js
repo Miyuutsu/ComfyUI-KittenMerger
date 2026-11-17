@@ -2444,7 +2444,9 @@ app.registerExtension({
 
                 treeScroll.style.display = "flex";
                 const prevScrollTop = treeScroll.scrollTop;
-                treeScroll.innerHTML = "";
+                while (treeScroll.firstChild) {
+                    treeScroll.removeChild(treeScroll.firstChild);
+                }
 
                 const treeGroups = buildTreeStructure(
                     this._mergerState.blockCount,
@@ -2632,7 +2634,7 @@ app.registerExtension({
         const onDrawBackground = nodeType.prototype.onDrawBackground;
         nodeType.prototype.onDrawBackground = function (ctx) {
             const now = performance.now();
-            if (!this._lastSlotCheckTime || now - this._lastSlotCheckTime > 1000) {
+            if (!this._lastSlotCheckTime || now - this._lastSlotCheckTime > 300) {
                 this._lastSlotCheckTime = now;
                 checkDynamicSlots(this);
             }
