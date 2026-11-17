@@ -1,6 +1,7 @@
 import gc
 import json
 import time
+import threading
 import weakref
 import torch
 import comfy.model_management
@@ -597,6 +598,7 @@ class AnimaModelMerger:
     _last_merge_sig = None
     _last_merge_result = None
     _source_stats_cache = {}
+    _cache_lock = threading.Lock()
 
     @classmethod
     def _evict_previous_allocations(cls, active_input_mps):
@@ -960,8 +962,9 @@ class AnimaModelMerger:
                 recipe_json=recipe_json,
             ),
         )
-        if AnimaModelMerger._last_merge_sig == merge_sig and AnimaModelMerger._last_merge_result is not None:
-            return AnimaModelMerger._last_merge_result
+        with AnimaModelMerger._cache_lock:
+            if AnimaModelMerger._last_merge_sig == merge_sig and AnimaModelMerger._last_merge_result is not None:
+                return AnimaModelMerger._last_merge_re
 
         self._evict_previous_allocations(models_dict.values())
         gc.collect()
@@ -2018,6 +2021,8 @@ class AnimaModelMerger:
             },
             "result": (schema_payload,) + tuple(ordered_model_outputs[:MAX_TOTAL_MODEL_OUTPUTS]),
         }
-        AnimaModelMerger._last_merge_sig = merge_sig
-        AnimaModelMerger._last_merge_result = ret
+
+        with AnimaModelMerger._cache_lock:
+            AnimaModelMerger._last_merge_sig = merge_sig
+            AnimaModelMerger._last_merge_result = ret
         return ret

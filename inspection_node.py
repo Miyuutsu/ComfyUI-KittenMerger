@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime
 import torch
@@ -163,6 +164,7 @@ class ModelMergeInspector:
     _last_cache_sig = None
     _last_cache_data = None
     _model_stats_cache = {}
+    _cache_lock = threading.Lock()
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -802,26 +804,28 @@ class ModelMergeInspector:
         precomputed_stats = getattr(merge_schema, "_kitten_precomputed_stats", None)
         precomputed_pair_diffs = getattr(merge_schema, "_kitten_precomputed_pair_diffs", None)
 
-        if ModelMergeInspector._last_cache_sig == sig and ModelMergeInspector._last_cache_data is not None:
-            data = ModelMergeInspector._last_cache_data
-            timings["Scan (Cached)"] = time.perf_counter() - t_phase
-            pbar.update_absolute(80, 100)
-        else:
-            data = self._scan_models(
-                models_dict,
-                rules,
-                compare_mode,
-                change_threshold,
-                zero_threshold,
-                stage_recipes=stage_recipes,
-                precomputed_stats=precomputed_stats,
-                precomputed_pair_diffs=precomputed_pair_diffs,
-                unique_id=unique_id,
-                pbar=pbar,
-            )
-            ModelMergeInspector._last_cache_sig = sig
-            ModelMergeInspector._last_cache_data = data
-            timings["Scan & Compare"] = time.perf_counter() - t_phase
+        with ModelMergeInspector._cache_lock:
+            if ModelMergeInspector._last_cache_sig == sig and ModelMergeInspector._last_cache_data is not None:
+                data = ModelMergeInspector._last_cache_data
+                timings["Scan (Cached)"] = time.perf_counter() - t_phase
+                pbar.update_absolute(80, 100)
+            else:
+                data = self._scan_models(
+                    models_dict,
+                    rules,
+                    compare_mode,
+                    change_threshold,
+                    zero_threshold,
+                    stage_recipes=stage_recipes,
+                    precomputed_stats=precomputed_stats,
+                    precomputed_pair_diffs=precomputed_pair_diffs,
+                    unique_id=unique_id,
+                    pbar=pbar,
+                )
+                with ModelMergeInspector._cache_lock:
+                    ModelMergeInspector._last_cache_sig = sig
+                    ModelMergeInspector._last_cache_data = data
+                timings["Scan & Compare"] = time.perf_counter() - t_phase
 
         lora_m_ids = data.get("lora_m_ids", set())
         blocks_data = data["blocks_data"]
