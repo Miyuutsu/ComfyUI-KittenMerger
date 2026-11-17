@@ -362,6 +362,13 @@ class AnimaModelSaver:
                         "tooltip": "When enabled on lora (SVD), runs an extra Kronecker SVD pass per layer to clamp singular value energy. Default off for 2x faster SVD saving.",
                     },
                 ),
+                "dora_scale": (
+                    ["passthrough", "merge", "drop"],
+                    {
+                        "default": "passthrough",
+                        "tooltip": "passthrough: keeps the primary LoRA's original dora_scale untouched. merge: blends dora_scale across stages. drop: omits dora_scale when saving.",
+                    },
+                ),
             },
             "optional": DynamicUniversalInputs({
                 "merge_schema": (
@@ -394,6 +401,7 @@ class AnimaModelSaver:
         lora_rank,
         lokr_factor,
         clamp_lora,
+        dora_scale_mode,
         device,
         unique_id=None,
         pbar=None,
@@ -436,6 +444,10 @@ class AnimaModelSaver:
                     out_sd[f"{prefix}.lora_up.weight"] = up_t.contiguous()
                     out_sd[f"{prefix}.lora_down.weight"] = down_t.contiguous()
                     out_sd[f"{prefix}.alpha"] = torch.tensor(float(alpha), dtype=torch.float32)
+                    if dora_scale_mode != "drop" and hasattr(raw_obj, "get_dora_scale"):
+                        ds = raw_obj.get_dora_scale(k, mode=dora_scale_mode)
+                        if ds is not None:
+                            out_sd[f"{prefix}.dora_scale"] = ds.detach().to(device="cpu", dtype=out_dtype).contiguous()
                 elif "diff" in entry and entry["diff"] is not None:
                     diff_t = (entry["diff"].detach().float() * eff_strength).to(dtype=out_dtype).contiguous().cpu()
                     out_sd[f"{prefix}.diff"] = diff_t
@@ -471,8 +483,13 @@ class AnimaModelSaver:
                 device=device,
                 clamp_lora=bool(clamp_lora),
             )
-            for sfx, tensor in layer_dict.items():
-                out_sd[f"{prefix}.{sfx}"] = tensor
+            if layer_dict:
+                for sfx, tensor in layer_dict.items():
+                    out_sd[f"{prefix}.{sfx}"] = tensor
+                if dora_scale_mode != "drop" and hasattr(raw_obj, "get_dora_scale"):
+                    ds = raw_obj.get_dora_scale(k, mode=dora_scale_mode)
+                    if ds is not None:
+                        out_sd[f"{prefix}.dora_scale"] = ds.detach().to(device="cpu", dtype=out_dtype).contiguous()
             del delta_t
 
         return out_sd
@@ -489,6 +506,7 @@ class AnimaModelSaver:
         lora_rank,
         lokr_factor,
         clamp_lora,
+        dora_scale_mode,
         device,
         unique_id=None,
         pbar=None,
@@ -501,6 +519,7 @@ class AnimaModelSaver:
                 lora_rank=lora_rank,
                 lokr_factor=lokr_factor,
                 clamp_lora=clamp_lora,
+                dora_scale_mode=dora_scale_mode,
                 device=device,
                 unique_id=unique_id,
                 pbar=pbar,
@@ -627,6 +646,7 @@ class AnimaModelSaver:
         lora_rank=32,
         lokr_factor=8,
         clamp_lora=False,
+        dora_scale="passthrough",
         merge_schema=None,
         prompt=None,
         extra_pnginfo=None,
@@ -691,6 +711,7 @@ class AnimaModelSaver:
                     lora_rank=lora_rank,
                     lokr_factor=lokr_factor,
                     clamp_lora=clamp_lora,
+                    dora_scale_mode=dora_scale,
                     device=device,
                     unique_id=unique_id,
                     pbar=pbar,
@@ -717,7 +738,6 @@ class AnimaModelSaver:
                 all_summaries.append(summary)
                 pbar.update_absolute(int((step_idx / total_items) * 100), 100)
         else:
-            # single_container mode: mux non-LoRAs together, and save any connected LoRAs to their own files
             lora_inputs = [x for x in classified_inputs if x[1] == "lora"]
             mux_inputs = [x for x in classified_inputs if x[1] != "lora"]
             mux_kinds = {x[1] for x in mux_inputs}
@@ -748,6 +768,7 @@ class AnimaModelSaver:
                         lora_rank=lora_rank,
                         lokr_factor=lokr_factor,
                         clamp_lora=clamp_lora,
+                        dora_scale_mode=dora_scale,
                         device=device,
                         unique_id=unique_id,
                         pbar=pbar,
@@ -787,6 +808,7 @@ class AnimaModelSaver:
                     lora_rank=lora_rank,
                     lokr_factor=lokr_factor,
                     clamp_lora=clamp_lora,
+                    dora_scale_mode=dora_scale,
                     device=device,
                     unique_id=unique_id,
                     pbar=pbar,

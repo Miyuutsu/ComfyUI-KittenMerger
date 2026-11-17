@@ -6,7 +6,11 @@ import torch
 import comfy.model_management
 import comfy.utils
 
-from .loader_nodes import KittenLoRAModel, materialize_single_lora_entry
+from .loader_nodes import (
+    KittenLoRAModel,
+    apply_dora_to_base_weight,
+    materialize_single_lora_entry,
+)
 from .utils import (
     MAX_DYNAMIC_MODELS,
     ZERO_INIT_SUFFIXES,
@@ -182,7 +186,6 @@ def get_cached_source_stats(src_id, sd, all_target_keys, stats_cache, is_lora=Fa
         if t is None:
             n = 0.0
         elif isinstance(t, dict):
-            # Unmaterialized LoRA entry dict {"up": ..., "down": ..., "diff": ...}
             sample_t = t.get("diff") if t.get("diff") is not None else t.get("up")
             n = 0.0 if (sample_t is None or is_tensor_zero_fast(sample_t, zero_tol=zero_tol)) else 1.0
         elif isinstance(t, tuple):
@@ -367,7 +370,87 @@ def align_sd_keys_to_reference(sd, clean_to_ref_key):
     return aligned
 
 
-def eval_single_key_stage_recipe(ps, k, clean_k, b_idx, get_calc_tensor_fn, skipped_blocks_by_source):
+def eval_dora_scale_for_stage(ps, k, clean_k, b_idx, dora_pt_map, dora_mg_map, skipped_blocks_by_source):
+    """
+    Computes both the Passthrough and Merged `dora_scale` tensors for a LoRA stage.
+    - Passthrough: preserves the primary LoRA source's original `dora_scale`.
+    - Merge: interpolates `dora_scale` on `ws`/`cosine` stages, extrapolates `A + w*(B - C)`
+      on `add_diff` stages, and preserves `A`'s base row scale on 2-input `add`/`sub` stages
+      so subtracting two LoRAs never zeroes out the base model's row norm.
+    """
+    st = ps["st"]
+    model_a_id = ps["model_a_id"]
+    model_b_id = ps["model_b_id"]
+    model_c_id = ps["model_c_id"]
+    has_model_c = ps["has_model_c"]
+    runtime_zero_ov = ps["runtime_zero_ov"]
+
+    pt_a = dora_pt_map.get(model_a_id, {}).get(k)
+    pt_b = dora_pt_map.get(model_b_id, {}).get(k)
+    mg_a = dora_mg_map.get(model_a_id, {}).get(k)
+    mg_b = dora_mg_map.get(model_b_id, {}).get(k)
+    mg_c = dora_mg_map.get(model_c_id, {}).get(k) if has_model_c else None
+
+    pt_out = pt_a if pt_a is not None else pt_b
+    if mg_a is None and mg_b is None:
+        return pt_out, None
+    if mg_a is None:
+        return pt_out, mg_b
+    if mg_b is None or mg_a.shape != mg_b.shape:
+        return pt_out, mg_a
+
+    w, op, has_w_override, has_op_override = resolve_weight_and_op_for_key(
+        clean_k, st, runtime_overrides=runtime_zero_ov
+    )
+    skip_a = skipped_blocks_by_source.get(model_a_id, set())
+    skip_b = skipped_blocks_by_source.get(model_b_id, set())
+    if b_idx is not None and not has_w_override and not has_op_override and op == "ws":
+        if (b_idx in skip_b) and (b_idx not in skip_a):
+            w = 1.0
+        elif (b_idx in skip_a) and (b_idx not in skip_b):
+            w = 0.0
+
+    orig_dt = mg_a.dtype
+    da = mg_a.detach().float()
+    db = mg_b.detach().float()
+
+    if op == "ws":
+        if abs(w - 1.0) <= 1e-7:
+            return pt_a, mg_a
+        if abs(w) <= 1e-7:
+            return (pt_b if pt_b is not None else pt_a), mg_b
+        merged_s = torch.lerp(db, da, float(w)).clamp(min=1e-6).to(dtype=orig_dt).contiguous()
+        return pt_out, merged_s
+
+    if op == "add_diff" and mg_c is not None and mg_c.shape == mg_a.shape:
+        dc = mg_c.detach().float()
+        merged_s = (da + float(w) * (db - dc)).clamp(min=1e-6).to(dtype=orig_dt).contiguous()
+        return pt_out, merged_s
+
+    if op in ("cosine_a", "cosine_b"):
+        t_b = 1.0 - float(w)
+        merged_s = torch.lerp(da, db, max(0.0, min(1.0, t_b * 0.5))).clamp(min=1e-6).to(dtype=orig_dt).contiguous()
+        return pt_out, merged_s
+
+    # For 2-model `add` / `sub`, `dora_scale` represents full weight magnitude ||W_0 + ΔW||,
+    # so subtracting `w * db` directly would destroy the base weight norm ||W_0||.
+    # Instead, shift by the inter-epoch scale difference (db - da) or preserve da when A == B.
+    if model_a_id == model_b_id:
+        return pt_out, mg_a
+    sign = 1.0 if op == "add" else -1.0
+    merged_s = (da + sign * float(w) * (db - da)).clamp(min=1e-6).to(dtype=orig_dt).contiguous()
+    return pt_out, merged_s
+
+
+def eval_single_key_stage_recipe(
+    ps,
+    k,
+    clean_k,
+    b_idx,
+    get_calc_tensor_fn,
+    skipped_blocks_by_source,
+    get_dora_info_fn=None,
+):
     """
     Evaluates a single stage `ps` on a single key `k` on the GPU in `calc_dtype`.
     Returns (merged_gpu_tensor_or_None, is_exact_a, is_exact_b).
@@ -429,15 +512,26 @@ def eval_single_key_stage_recipe(ps, k, clean_k, b_idx, get_calc_tensor_fn, skip
     if has_valid_c and tc_calc is None:
         tc_calc = torch.zeros_like(ta_calc)
 
+    dora_a = get_dora_info_fn(model_a_id) if get_dora_info_fn is not None else None
+    dora_b = get_dora_info_fn(model_b_id) if get_dora_info_fn is not None else None
+
     if op == "ws":
         if not is_a_lora and is_b_lora:
             eff_b_w = 1.0 - float(w)
             if abs(eff_b_w) <= 1e-7:
                 return ta_calc, True, False
+            if dora_b is not None:
+                d_scale, b_str = dora_b
+                unscaled_b = tb_calc / b_str if abs(b_str) > 1e-7 else tb_calc
+                return apply_dora_to_base_weight(ta_calc, unscaled_b, d_scale, eff_b_w * b_str), False, False
             return ta_calc + eff_b_w * tb_calc, False, False
         elif is_a_lora and not is_b_lora:
             if abs(w) <= 1e-7:
                 return tb_calc, False, True
+            if dora_a is not None:
+                d_scale, a_str = dora_a
+                unscaled_a = ta_calc / a_str if abs(a_str) > 1e-7 else ta_calc
+                return apply_dora_to_base_weight(tb_calc, unscaled_a, d_scale, float(w) * a_str), False, False
             return tb_calc + float(w) * ta_calc, False, False
         else:
             if abs(w - 1.0) <= 1e-7:
@@ -449,11 +543,19 @@ def eval_single_key_stage_recipe(ps, k, clean_k, b_idx, get_calc_tensor_fn, skip
     elif op == "add":
         if abs(w) <= 1e-7:
             return ta_calc, True, False
+        if not is_a_lora and is_b_lora and dora_b is not None:
+            d_scale, b_str = dora_b
+            unscaled_b = tb_calc / b_str if abs(b_str) > 1e-7 else tb_calc
+            return apply_dora_to_base_weight(ta_calc, unscaled_b, d_scale, float(w) * b_str), False, False
         return ta_calc + float(w) * tb_calc, False, False
 
     elif op == "sub":
         if abs(w) <= 1e-7:
             return ta_calc, True, False
+        if not is_a_lora and is_b_lora and dora_b is not None:
+            d_scale, b_str = dora_b
+            unscaled_b = tb_calc / b_str if abs(b_str) > 1e-7 else tb_calc
+            return apply_dora_to_base_weight(ta_calc, unscaled_b, d_scale, -float(w) * b_str), False, False
         return ta_calc - float(w) * tb_calc, False, False
 
     elif op == "add_diff":
@@ -470,7 +572,12 @@ def eval_single_key_stage_recipe(ps, k, clean_k, b_idx, get_calc_tensor_fn, skip
         if has_valid_c:
             b_eff = ta_calc + (tb_calc - tc_calc)
         elif not is_a_lora and is_b_lora:
-            b_eff = ta_calc + tb_calc
+            if dora_b is not None:
+                d_scale, b_str = dora_b
+                unscaled_b = tb_calc / b_str if abs(b_str) > 1e-7 else tb_calc
+                b_eff = apply_dora_to_base_weight(ta_calc, unscaled_b, d_scale, b_str)
+            else:
+                b_eff = ta_calc + tb_calc
         else:
             b_eff = tb_calc
 
@@ -656,12 +763,7 @@ class AnimaModelMerger:
         return 40 if (t is None or t >= 40) else 28
 
     def _find_downstream_wired_stages(self, prompt, unique_id, json_model_output_count, stage_ids_in_order, recipe_connected_stages):
-        """
-        Determines which stages have downstream MODEL wires connected (either directly on
-        AnimaModelMerger or on a connected ModelMergeInspector).
-        """
         needed = set(recipe_connected_stages or [])
-
         if not prompt or not unique_id:
             return needed
 
@@ -688,7 +790,6 @@ class AnimaModelMerger:
                     if 0 <= st_idx < len(stage_ids_in_order):
                         needed.add(stage_ids_in_order[st_idx])
 
-        # Also check which stage output slots on any connected ModelMergeInspector are wired downstream
         if inspector_node_ids:
             for node_id, node_info in prompt.items():
                 if not isinstance(node_info, dict):
@@ -706,7 +807,6 @@ class AnimaModelMerger:
         return needed
 
     def _find_downstream_wired_passthrough_models(self, prompt, unique_id, json_model_output_count, m_ids):
-        """Returns base model IDs (m1..mN) whose passthrough output slots are wired downstream."""
         if not prompt or not unique_id:
             return set(m_ids)
 
@@ -758,6 +858,8 @@ class AnimaModelMerger:
         display_name=None,
         lora_entries=None,
         lora_strength=1.0,
+        dora_scales_passthrough=None,
+        dora_scales_merged=None,
     ):
         if template_mp is None or getattr(template_mp, "_kitten_is_lora", False):
             if lora_entries is not None and not target_sd:
@@ -765,12 +867,16 @@ class AnimaModelMerger:
                     lora_entries=lora_entries,
                     strength=lora_strength,
                     name=display_name or stage_id or source_id or "lora",
+                    dora_scales_passthrough=dora_scales_passthrough,
+                    dora_scales_merged=dora_scales_merged,
                 )
             else:
                 lora_out = KittenLoRAModel(
                     precomputed_sd=target_sd,
                     strength=1.0,
                     name=display_name or stage_id or source_id or "merged_lora",
+                    dora_scales_passthrough=dora_scales_passthrough,
+                    dora_scales_merged=dora_scales_merged,
                 )
             lora_out._kitten_merged = merged_flag
             lora_out._kitten_stage_id = stage_id
@@ -855,7 +961,6 @@ class AnimaModelMerger:
         if AnimaModelMerger._last_merge_sig == merge_sig and AnimaModelMerger._last_merge_result is not None:
             return AnimaModelMerger._last_merge_result
 
-        # Evict previous run's stage tensors before allocating anything for the new run
         self._evict_previous_allocations(models_dict.values())
         gc.collect()
         comfy.model_management.soft_empty_cache()
@@ -962,7 +1067,6 @@ class AnimaModelMerger:
             m_ids,
         )
 
-        # Check if a ModelMergeInspector is wired to merge_schema (slot 0)
         has_downstream_inspector = False
         if prompt and unique_id:
             my_id_str = str(unique_id)
@@ -975,7 +1079,6 @@ class AnimaModelMerger:
                             has_downstream_inspector = True
                             break
 
-        # A stage is needed if it is enabled OR wired downstream, plus any parent stages it depends on
         active_stage_ids = {
             s_id for s_id in stage_ids_in_order
             if stage_meta_by_id[s_id]["enabled"] or s_id in wired_stage_ids
@@ -994,13 +1097,11 @@ class AnimaModelMerger:
                     active_stage_ids.add(dep)
                     queue.append(dep)
 
-        # Materialize full CPU ModelPatchers for wired stages and the last enabled stage
         materialized_stage_ids = set(wired_stage_ids)
         enabled_in_order = [s_id for s_id in stage_ids_in_order if s_id in active_stage_ids]
         if enabled_in_order:
             materialized_stage_ids.add(enabled_in_order[-1])
 
-        # Determine which base models (m1..mN) are actually needed
         active_m_ids = set(wired_passthrough_m_ids)
         for s_id in active_stage_ids:
             meta = stage_meta_by_id[s_id]
@@ -1008,7 +1109,6 @@ class AnimaModelMerger:
                 if dep in models_dict:
                     active_m_ids.add(dep)
 
-        # If all stages are disabled (passthrough mode), only load models that actually need tier scaling
         if not active_stage_ids:
             active_m_ids = set(wired_passthrough_m_ids) if wired_passthrough_m_ids else set(m_ids)
         if target_tier == "match_model_1" and "m1" in models_dict:
@@ -1052,7 +1152,6 @@ class AnimaModelMerger:
                 len(active_m_list),
             )
             if is_lora:
-                # Keep unmaterialized LoRAs in their tiny low-rank dict format (0 dense RAM overhead!)
                 if getattr(mp, "_precomputed_sd", None) is not None:
                     raw_sds[m] = dict(mp._precomputed_sd)
                     tier, _ = detect_block_tier(raw_sds[m].keys())
@@ -1063,7 +1162,6 @@ class AnimaModelMerger:
                 tiers_by_id[m] = tier
             else:
                 if not active_stage_ids and not getattr(mp, "patches", None):
-                    # Pure passthrough with no stages enabled: inspect keys without copying tensors
                     raw_sds[m] = mp.model.state_dict()
                 else:
                     raw_sds[m] = materialize_patched_state_dict(mp, device=device)
@@ -1098,7 +1196,6 @@ class AnimaModelMerger:
         for idx, m in enumerate(active_m_list, start=1):
             orig_tier = tiers_by_id[m]
             needs_tier_scale = orig_tier != resolved_tier and orig_tier is not None
-            # When all stages are disabled, only scale a passthrough model if its output slot is wired
             if not active_stage_ids and m not in wired_passthrough_m_ids:
                 needs_tier_scale = False
 
@@ -1167,6 +1264,38 @@ class AnimaModelMerger:
                     if ck not in clean_to_ref_key:
                         clean_to_ref_key[ck] = f"diffusion_model.{ck}"
                 aligned_lora_entries[m] = align_sd_keys_to_reference(aligned_lora_entries[m], clean_to_ref_key)
+
+        dora_pt_by_source = {}
+        dora_mg_by_source = {}
+        for m in active_m_list:
+            if m in aligned_lora_entries:
+                d_map = {
+                    k: v["dora_scale"]
+                    for k, v in aligned_lora_entries[m].items()
+                    if isinstance(v, dict) and v.get("dora_scale") is not None
+                }
+                dora_pt_by_source[m] = dict(d_map)
+                dora_mg_by_source[m] = dict(d_map)
+            elif source_is_lora.get(m, False):
+                mp = models_dict[m]
+                pt_raw = getattr(mp, "_dora_scales_passthrough", None) or {}
+                mg_raw = getattr(mp, "_dora_scales_merged", None) or pt_raw
+                orig_t = tiers_by_id.get(m)
+                if orig_t != resolved_tier and orig_t is not None:
+                    if pt_raw:
+                        pt_wrapped = {k: {"dora_scale": v} for k, v in pt_raw.items()}
+                        pt_conv, _ = convert_lora_entries_to_tier(
+                            pt_wrapped, orig_t, resolved_tier, upscale_fill_mode=upscale_fill_mode
+                        )
+                        pt_raw = {k: v["dora_scale"] for k, v in pt_conv.items()}
+                    if mg_raw:
+                        mg_wrapped = {k: {"dora_scale": v} for k, v in mg_raw.items()}
+                        mg_conv, _ = convert_lora_entries_to_tier(
+                            mg_wrapped, orig_t, resolved_tier, upscale_fill_mode=upscale_fill_mode
+                        )
+                        mg_raw = {k: v["dora_scale"] for k, v in mg_conv.items()}
+                dora_pt_by_source[m] = align_sd_keys_to_reference(pt_raw, clean_to_ref_key)
+                dora_mg_by_source[m] = align_sd_keys_to_reference(mg_raw, clean_to_ref_key)
 
         union_target_keys = set()
         for m in active_m_list:
@@ -1243,6 +1372,8 @@ class AnimaModelMerger:
             sources_lineage[s_id] = {}
             direct_stage_lineage[s_id] = {}
             skipped_blocks_by_source[s_id] = set()
+            dora_pt_by_source[s_id] = {}
+            dora_mg_by_source[s_id] = {}
 
             runtime_zero_ov = None
             if st.get("fix_zeros", False):
@@ -1443,6 +1574,20 @@ class AnimaModelMerger:
                     gpu_calc_tensors[src_id] = gt
                     return gt
 
+                def get_dora_info(src_id):
+                    d_scale = dora_mg_by_source.get(src_id, {}).get(k)
+                    if d_scale is None:
+                        d_scale = dora_pt_by_source.get(src_id, {}).get(k)
+                    if d_scale is None:
+                        return None
+                    if src_id in aligned_lora_entries:
+                        entry = aligned_lora_entries[src_id].get(k)
+                        e_scale = float(entry.get("scale", 1.0)) if isinstance(entry, dict) else 1.0
+                        eff_str = float(lora_strengths.get(src_id, 1.0)) * e_scale
+                    else:
+                        eff_str = float(lora_strengths.get(src_id, 1.0))
+                    return d_scale, eff_str
+
                 if has_downstream_inspector:
                     for src_m in active_m_list:
                         if k not in precomputed_stats[src_m]:
@@ -1505,6 +1650,15 @@ class AnimaModelMerger:
                             runtime_zero_ov = None
                         ps["runtime_zero_ov"] = runtime_zero_ov
 
+                    if ps.get("out_stage_is_lora"):
+                        pt_s, mg_s = eval_dora_scale_for_stage(
+                            ps, k, clean_k, b_idx, dora_pt_by_source, dora_mg_by_source, skipped_blocks_by_source
+                        )
+                        if pt_s is not None:
+                            dora_pt_by_source[s_id][k] = pt_s
+                        if mg_s is not None:
+                            dora_mg_by_source[s_id][k] = mg_s
+
                     lin_a = sources_lineage[model_a_id].get(k, {})
                     lin_b = sources_lineage[model_b_id].get(k, {})
                     lin_c = sources_lineage[model_c_id].get(k, {}) if has_model_c else None
@@ -1561,6 +1715,7 @@ class AnimaModelMerger:
                             if has_downstream_inspector:
                                 precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = 0.0
                             continue
+
                     if ps.get("can_preserve_lowrank") and not need_stage_norm and not has_downstream_inspector:
                         src_entry = aligned_lora_entries[model_a_id].get(k)
                         if src_entry is None:
@@ -1582,10 +1737,19 @@ class AnimaModelMerger:
                             aligned_lora_entries[s_id][k] = new_entry
                             sources_lineage[s_id][k] = combine_lineage_dicts([(scale_factor, lin_a)])
                             direct_stage_lineage[s_id][k] = {model_a_id: round(scale_factor, 6)}
+                        else:
+                            dora_pt_by_source[s_id].pop(k, None)
+                            dora_mg_by_source[s_id].pop(k, None)
                         continue
 
                     merged_gpu, is_exact_a, is_exact_b = eval_single_key_stage_recipe(
-                        ps, k, clean_k, b_idx, get_calc_tensor, skipped_blocks_by_source
+                        ps,
+                        k,
+                        clean_k,
+                        b_idx,
+                        get_calc_tensor,
+                        skipped_blocks_by_source,
+                        get_dora_info_fn=get_dora_info,
                     )
                     if merged_gpu is None:
                         continue
@@ -1688,6 +1852,8 @@ class AnimaModelMerger:
                     display_name=getattr(models_dict[m_id], "_kitten_display_name", m_id),
                     lora_entries=aligned_lora_entries[m_id],
                     lora_strength=lora_strengths.get(m_id, 1.0),
+                    dora_scales_passthrough=dora_pt_by_source.get(m_id),
+                    dora_scales_merged=dora_mg_by_source.get(m_id),
                 )
             elif m_id not in aligned_sds or m_id not in scaled_models_converted:
                 cloned = models_dict[m_id].clone()
@@ -1702,6 +1868,8 @@ class AnimaModelMerger:
                     merged_flag=False,
                     source_id=m_id,
                     display_name=getattr(models_dict[m_id], "_kitten_display_name", m_id),
+                    dora_scales_passthrough=dora_pt_by_source.get(m_id),
+                    dora_scales_merged=dora_mg_by_source.get(m_id),
                 )
             else:
                 passthrough_mps[m_id] = self._build_model_patcher_from_sd(
@@ -1734,6 +1902,8 @@ class AnimaModelMerger:
                     display_name=disp_name,
                     lora_entries=aligned_lora_entries.get(s_id),
                     lora_strength=lora_strengths.get(s_id, 1.0),
+                    dora_scales_passthrough=dora_pt_by_source.get(s_id),
+                    dora_scales_merged=dora_mg_by_source.get(s_id),
                 )
                 stage_mps[s_id] = mp_out
                 virtual_stage_mps[s_id] = mp_out
@@ -1776,7 +1946,6 @@ class AnimaModelMerger:
                 d_kmap[k] = palette_map[d_sig_str]
             stage_direct_maps[s_id] = d_kmap
 
-        # Bundle active models and active stages (or all connected models if all stages are disabled)
         inspector_m_ids = set()
         for s_id in enabled_in_order:
             meta = stage_meta_by_id[s_id]

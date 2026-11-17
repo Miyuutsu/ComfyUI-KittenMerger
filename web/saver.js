@@ -173,6 +173,7 @@ app.registerExtension({
             if (!fmtWidget) return;
 
             const isFullDiff = fmtWidget.value === "full_diff (lossless step)";
+            const doraWidget = node.widgets?.find((w) => w.name === "dora_scale"); if (doraWidget) doraWidget.disabled = isFullDiff;
             const isLokr = fmtWidget.value === "lokr";
             if (rankWidget) rankWidget.disabled = isFullDiff;
             if (lokrWidget) lokrWidget.disabled = !isLokr;

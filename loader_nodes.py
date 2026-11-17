@@ -95,6 +95,9 @@ def build_anima_lora_key_map(max_blocks=60):
             "mlp.down_proj",
             "mlp.layer1",
             "mlp.layer2",
+            "norm_self_attn",
+            "norm_cross_attn",
+            "norm_mlp",
             "norm1",
             "norm2",
             "input_layernorm",
@@ -158,7 +161,6 @@ def resolve_underscore_module_to_clean(u_part, is_bias=False):
         base_w = ANIMA_UNDERSCORE_WEIGHT_MAP[u_part]
         return (base_w[:-7] + ext) if is_bias else base_w
 
-    # Dynamic regex fallback for any block index or sub-layer
     m_blk = re.match(
         r"^blocks_(\d+)_(adaln_modulation_self_attn|adaln_modulation_cross_attn|adaln_modulation_mlp|self_attn|cross_attn|mlp)_(.+)$",
         u_part,
@@ -168,6 +170,14 @@ def resolve_underscore_module_to_clean(u_part, is_bias=False):
         rest_dots = rest.replace("_proj", ".proj").replace(".", "_")
         if rest_dots in ("q_proj", "k_proj", "v_proj", "output_proj", "q_norm", "k_norm", "layer1", "layer2", "1", "2"):
             return f"blocks.{b_idx}.{sub}.{rest}{ext}"
+
+    m_llm_norm = re.match(
+        r"^llm_adapter_blocks_(\d+)_(norm_self_attn|norm_cross_attn|norm_mlp|norm1|norm2|input_layernorm|post_attention_layernorm)$",
+        u_part,
+    )
+    if m_llm_norm:
+        b_idx, norm_name = m_llm_norm.groups()
+        return f"llm_adapter.blocks.{b_idx}.{norm_name}{ext}"
 
     m_llm = re.match(r"^llm_adapter_blocks_(\d+)_(self_attn|cross_attn|mlp)_(.+)$", u_part)
     if m_llm:
@@ -179,8 +189,13 @@ def resolve_underscore_module_to_clean(u_part, is_bias=False):
 
 def parse_direct_lora_pairs(lora_sd):
     """
-    Direct parser for LoRA keys.
-    Returns dict: { "diffusion_model.<clean_key>": {"up": Tensor, "down": Tensor, "alpha": float|None, "diff": Tensor|None} }
+    Direct parser for LoRA/DoRA keys.
+    Returns dict:
+      { "diffusion_model.<clean_key>": {
+          "up": Tensor, "down": Tensor, "alpha": float|None,
+          "dora_scale": Tensor|None, "diff": Tensor|None
+        }
+      }
     """
     entries = {}
 
@@ -227,6 +242,12 @@ def parse_direct_lora_pairs(lora_sd):
             target_k = normalize_base_to_key(m_alpha.group(1), is_bias=False)
             val = float(v.item()) if isinstance(v, torch.Tensor) and v.numel() == 1 else float(v)
             entries.setdefault(target_k, {})["alpha"] = val
+            continue
+
+        m_dora = re.match(r"^(.+?)\.dora_scale$", k)
+        if m_dora:
+            target_k = normalize_base_to_key(m_dora.group(1), is_bias=False)
+            entries.setdefault(target_k, {})["dora_scale"] = v
             continue
 
         m_diff = re.match(r"^(.+?)\.diff$", k)
@@ -318,6 +339,31 @@ def materialize_single_lora_entry(patch_entry, strength, dtype, device):
     return None
 
 
+def apply_dora_to_base_weight(base_weight, unscaled_delta, dora_scale, multiplier):
+    """
+    Applies true DoRA weight decomposition to `base_weight` on the GPU:
+      1. Full directional weight: W_combined = W_0 + ΔW_unscaled
+      2. Row-normalize W_combined and scale by `dora_scale`:
+         W_dora = (dora_scale / ||W_combined||_row) * W_combined
+      3. Apply stage multiplier: W_0 + multiplier * (W_dora - W_0)
+    """
+    if dora_scale is None:
+        return base_weight + float(multiplier) * unscaled_delta
+
+    d_scale = dora_scale.to(device=base_weight.device, dtype=base_weight.dtype)
+    while d_scale.ndim < base_weight.ndim:
+        d_scale = d_scale.unsqueeze(-1)
+
+    combined = base_weight + unscaled_delta
+    dims = tuple(range(1, combined.ndim))
+    weight_norm = torch.linalg.vector_norm(combined, dim=dims, keepdim=True).clamp(min=1e-6)
+    dora_target = combined * (d_scale / weight_norm)
+
+    if abs(float(multiplier) - 1.0) <= 1e-7:
+        return dora_target
+    return base_weight + float(multiplier) * (dora_target - base_weight)
+
+
 class _DummyInnerModel:
     def __init__(self, state_dict_fn):
         self._state_dict_fn = state_dict_fn
@@ -328,12 +374,20 @@ class _DummyInnerModel:
 
 class KittenLoRAModel:
     """
-    A ModelPatcher-compatible wrapper representing a pure standalone LoRA (or merged LoRA).
+    A ModelPatcher-compatible wrapper representing a pure standalone LoRA/DoRA (or merged LoRA).
     Can be wired directly into AnimaModelMerger or ModelMergeInspector on MODEL slots.
     Materializes ΔW tensors at the Merger's exact calculation precision (fp32/fp64/bf16).
     """
 
-    def __init__(self, lora_entries=None, strength=1.0, precomputed_sd=None, name="lora"):
+    def __init__(
+        self,
+        lora_entries=None,
+        strength=1.0,
+        precomputed_sd=None,
+        name="lora",
+        dora_scales_passthrough=None,
+        dora_scales_merged=None,
+    ):
         self._kitten_is_lora = True
         self._kitten_merged = False
         self._kitten_stage_id = None
@@ -343,6 +397,12 @@ class KittenLoRAModel:
         self.strength = float(strength)
         self.lora_entries = dict(lora_entries) if lora_entries else {}
         self._precomputed_sd = dict(precomputed_sd) if precomputed_sd is not None else None
+        self._dora_scales_passthrough = (
+            dict(dora_scales_passthrough) if dora_scales_passthrough is not None else {}
+        )
+        self._dora_scales_merged = (
+            dict(dora_scales_merged) if dora_scales_merged is not None else {}
+        )
         self._cached_fp32_sd = None
         self.patches = {}
         self.patches_uuid = uuid.uuid4()
@@ -360,6 +420,20 @@ class KittenLoRAModel:
         if self._precomputed_sd is not None:
             return set(self._precomputed_sd.keys())
         return set(self.lora_entries.keys())
+
+    def get_dora_scale(self, key, mode="passthrough"):
+        if mode == "drop":
+            return None
+        if mode == "merge" and key in self._dora_scales_merged:
+            return self._dora_scales_merged[key]
+        if key in self._dora_scales_passthrough:
+            return self._dora_scales_passthrough[key]
+        if key in self._dora_scales_merged:
+            return self._dora_scales_merged[key]
+        entry = self.lora_entries.get(key)
+        if isinstance(entry, dict):
+            return entry.get("dora_scale")
+        return None
 
     def materialize_key(self, key, dtype=torch.float32, device=None):
         forced_dt = getattr(self, "_kitten_forced_dtype", None) or dtype
@@ -395,6 +469,8 @@ class KittenLoRAModel:
             strength=self.strength,
             precomputed_sd=dict(self._precomputed_sd) if self._precomputed_sd is not None else None,
             name=self.name,
+            dora_scales_passthrough=self._dora_scales_passthrough,
+            dora_scales_merged=self._dora_scales_merged,
         )
         cloned._kitten_merged = self._kitten_merged
         cloned._kitten_stage_id = self._kitten_stage_id
@@ -643,10 +719,17 @@ class AnimaLoRALoader:
         clean_lora_name = clean_model_display_name(lora_name)
 
         if base_model is None:
+            dora_pt = {
+                k: v["dora_scale"]
+                for k, v in entries.items()
+                if isinstance(v, dict) and v.get("dora_scale") is not None
+            }
             lora_model = KittenLoRAModel(
                 lora_entries=entries,
                 strength=strength,
                 name=clean_lora_name,
+                dora_scales_passthrough=dora_pt,
+                dora_scales_merged=dora_pt,
             )
             return (lora_model,)
 
@@ -663,10 +746,17 @@ class AnimaLoRALoader:
                 else:
                     combined_sd[k] = delta_t.contiguous()
 
+            dora_pt = dict(getattr(base_model, "_dora_scales_passthrough", {}) or {})
+            for k, v in entries.items():
+                if isinstance(v, dict) and v.get("dora_scale") is not None and k not in dora_pt:
+                    dora_pt[k] = v["dora_scale"]
+
             stacked = KittenLoRAModel(
                 precomputed_sd=combined_sd,
                 strength=1.0,
                 name=f"{getattr(base_model, '_kitten_display_name', 'lora')}+{clean_lora_name}",
+                dora_scales_passthrough=dora_pt,
+                dora_scales_merged=dora_pt,
             )
             return (stacked,)
 
