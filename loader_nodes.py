@@ -1,3 +1,4 @@
+import gc as _gc
 import inspect
 import os
 import re
@@ -457,10 +458,14 @@ class KittenLoRAModel:
 
         target_dev = device if device is not None else comfy.model_management.get_torch_device()
         out_sd = {}
-        for k, entry in self.lora_entries.items():
-            delta = materialize_single_lora_entry(entry, self.strength, dtype=dtype, device=target_dev)
-            if delta is not None:
-                out_sd[k] = delta.detach().cpu().contiguous()
+        keys = list(self.lora_entries.keys())
+        for i in range(0, len(keys), 32):
+            for k in keys[i:i+32]:
+                entry = self.lora_entries[k]
+                delta = materialize_single_lora_entry(entry, self.strength, dtype=dtype, device=target_dev)
+                if delta is not None:
+                    out_sd[k] = delta.detach().cpu().contiguous()
+            _gc.collect()
         return out_sd
 
     def clone(self):
