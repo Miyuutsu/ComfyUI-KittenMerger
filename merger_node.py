@@ -993,6 +993,8 @@ class AnimaModelMerger:
                 parsed = json.loads(recipe_json)
                 if isinstance(parsed, dict):
                     if isinstance(parsed.get("stages"), list):
+                        if len(parsed["stages"]) > 64:
+                            raise ValueError(f"Recipe has {len(parsed['stages'])} stages; maximum 64 supported.")
                         stages = parsed["stages"]
                     if isinstance(parsed.get("modelOutputCount"), int) and parsed["modelOutputCount"] >= 1:
                         json_model_output_count = max(highest_connected_idx, parsed["modelOutputCount"])
