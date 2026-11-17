@@ -539,7 +539,7 @@ app.registerExtension({
         const onDrawBackground = nodeType.prototype.onDrawBackground;
         nodeType.prototype.onDrawBackground = function (ctx) {
             const now = performance.now();
-            if (!this._lastSlotCheckTime || now - this._lastSlotCheckTime > 300) {
+            if (!this._lastSlotCheckTime || now - this._lastSlotCheckTime > 1000) {
                 this._lastSlotCheckTime = now;
                 checkDynamicSlots(this);
             }

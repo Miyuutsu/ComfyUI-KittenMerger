@@ -365,7 +365,7 @@ app.registerExtension({
         const onDrawBackground = nodeType.prototype.onDrawBackground;
         nodeType.prototype.onDrawBackground = function () {
             const now = performance.now();
-            if (!this._lastUnivSlotCheck || now - this._lastUnivSlotCheck > 300) {
+            if (!this._lastUnivSlotCheck || now - this._lastUnivSlotCheck > 1000) {
                 this._lastUnivSlotCheck = now;
                 checkSlots(this);
             }
