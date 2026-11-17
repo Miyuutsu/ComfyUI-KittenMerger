@@ -593,6 +593,9 @@ def downscale_dict_single_stage(state_dict, manifest, absorb_arg, ratio, device)
         else:
             new_state_dict[k] = v
 
+    if not keys_by_high_block and len(state_dict) > 0:
+        raise ValueError(f"Downscale {manifest['old_block_count']}->{manifest['new_block_count']}: no block keys found. Check model architecture.")
+
     for high_idx, keys in sorted(keys_by_high_block.items()):
         if high_idx in insertion_positions or high_idx not in target_to_source:
             continue
@@ -723,6 +726,9 @@ def convert_state_dict_to_tier(
 ):
     if current_tier == target_tier or current_tier is None:
         return state_dict, set()
+
+    if not isinstance(state_dict, dict) or len(state_dict) == 0:
+        raise ValueError(f"convert_state_dict_to_tier: empty or invalid state_dict for tier {current_tier} -> {target_tier}")
 
     sd = state_dict
     skipped = set()
