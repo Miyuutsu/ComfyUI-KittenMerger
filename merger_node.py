@@ -88,7 +88,10 @@ class VirtualStageModel:
         self.model = self
 
     def state_dict(self):
-        return {}
+        raise RuntimeError(
+            f"VirtualStageModel '{self._kitten_stage_id}' has no tensors. "
+            "Wire its MODEL output from Anima Model Merger to materialize it."
+        )
 
     def clone(self):
         return VirtualStageModel(
