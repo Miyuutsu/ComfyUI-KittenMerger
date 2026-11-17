@@ -833,9 +833,10 @@ class AnimaModelSaver:
         pbar.update_absolute(100, 100)
         result_str = "\n".join(saved_paths) if saved_paths else "Nothing saved."
         send_kitten_progress(unique_id, "done", f"Saved {len(saved_paths)} file(s) ({elapsed:.2f}s)", 100, 100)
+        comfy.utils.common_options = {"verbose": True}
         print(  # noqa: T201
-            f"[KittenMerger] AnimaModelSaver saved {len(saved_paths)} file(s) in {elapsed:.2f}s: "
-            f"{', '.join(saved_paths)} ({' | '.join(all_summaries)})"
-        )
+             f"[KittenMerger] AnimaModelSaver saved {len(saved_paths)} file(s) in {elapsed:.2f}s: "
+             f"{', '.join(saved_paths)} ({' | '.join(all_summaries)})"
+         )
 
         return {"ui": {"saved_path": [result_str]}, "result": (result_str,)}
