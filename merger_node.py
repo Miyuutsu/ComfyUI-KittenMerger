@@ -601,6 +601,8 @@ class AnimaModelMerger:
     @classmethod
     def _evict_previous_allocations(cls, active_input_mps):
         active_ids = {id(mp) for mp in active_input_mps if mp is not None}
+        cls._allocated_patchers = [ref for ref in cls._allocated_patchers if ref() is not None]
+        cls._allocated_schemas = [ref for ref in cls._allocated_schemas if ref() is not None]
         for ref in cls._allocated_patchers:
             mp = ref()
             if mp is not None and id(mp) not in active_ids:
