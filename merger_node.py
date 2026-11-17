@@ -15,6 +15,7 @@ from .loader_nodes import (
 from .utils import (
     MAX_DYNAMIC_MODELS,
     ZERO_INIT_SUFFIXES,
+    EPSILON,
     DynamicModelInputs,
     MergerSchemaPayload,
     convert_lora_entries_to_tier,
@@ -423,17 +424,17 @@ def eval_dora_scale_for_stage(ps, k, clean_k, b_idx, dora_pt_map, dora_mg_map, s
             return pt_a, mg_a
         if abs(w) <= 1e-7:
             return (pt_b if pt_b is not None else pt_a), mg_b
-        merged_s = torch.lerp(db, da, float(w)).clamp(min=1e-6).to(dtype=orig_dt).contiguous()
+        merged_s = torch.lerp(db, da, float(w)).clamp(min=EPSILON * 100).to(dtype=orig_dt).contiguous()
         return pt_out, merged_s
 
     if op == "add_diff" and mg_c is not None and mg_c.shape == mg_a.shape:
         dc = mg_c.detach().float()
-        merged_s = (da + float(w) * (db - dc)).clamp(min=1e-6).to(dtype=orig_dt).contiguous()
+        merged_s = (da + float(w) * (db - dc)).clamp(min=EPSILON * 100).to(dtype=orig_dt).contiguous()
         return pt_out, merged_s
 
     if op in ("cosine_a", "cosine_b"):
         t_b = 1.0 - float(w)
-        merged_s = torch.lerp(da, db, max(0.0, min(1.0, t_b * 0.5))).clamp(min=1e-6).to(dtype=orig_dt).contiguous()
+        merged_s = torch.lerp(da, db, max(0.0, min(1.0, t_b * 0.5))).clamp(min=EPSILON * 100).to(dtype=orig_dt).contiguous()
         return pt_out, merged_s
 
     # For 2-model `add` / `sub`, `dora_scale` represents full weight magnitude ||W_0 + ΔW||,
@@ -442,7 +443,7 @@ def eval_dora_scale_for_stage(ps, k, clean_k, b_idx, dora_pt_map, dora_mg_map, s
     if model_a_id == model_b_id:
         return pt_out, mg_a
     sign = 1.0 if op == "add" else -1.0
-    merged_s = (da + sign * float(w) * (db - da)).clamp(min=1e-6).to(dtype=orig_dt).contiguous()
+    merged_s = (da + sign * float(w) * (db - da)).clamp(min=EPSILON * 100).to(dtype=orig_dt).contiguous()
     return pt_out, merged_s
 
 

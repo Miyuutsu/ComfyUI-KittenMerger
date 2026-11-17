@@ -3,6 +3,7 @@ import re
 import torch
 import comfy.lora
 
+EPSILON = 1e-8
 MAX_DYNAMIC_MODELS = 32
 
 MANIFEST_28_TO_40 = {
@@ -330,7 +331,7 @@ def inspect_tensor_stats(tensor, device=None):
             return 0.0, True
         norm = torch.linalg.norm(t.double()).item()
 
-    if norm < 1e-7:
+    if norm < EPSILON * 10:
         return 0.0, False
     return (norm / (t.numel() ** 0.5)) * 100.0, False
 
