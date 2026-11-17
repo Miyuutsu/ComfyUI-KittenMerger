@@ -1763,6 +1763,10 @@ class AnimaModelMerger:
                     if merged_gpu is None:
                         continue
 
+                    if merged_gpu.is_floating_point() and not torch.isfinite(merged_gpu).all():
+                        print(f"[KittenMerger] WARNING: Non-finite tensor at stage {s_id}, key {k} — clamping")
+                        merged_gpu = torch.nan_to_num(merged_gpu, nan=0.0, posinf=1e6, neginf=-1e6)
+
                     gpu_calc_tensors[s_id] = merged_gpu
                     store_dtype = calc_dtype
 
