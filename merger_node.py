@@ -1838,6 +1838,10 @@ class AnimaModelMerger:
                 gpu_calc_tensors.clear()
                 cpu_exact_refs.clear()
 
+                if processed_keys % 256 == 0:
+                    gc.collect()
+                    comfy.model_management.soft_empty_cache()
+
         timings[f"Merge ({len(prepared_stages)} st)"] = time.perf_counter() - t_phase
         t_phase = time.perf_counter()
         send_kitten_progress(unique_id, "Step 4/4: Building Outputs", "Wrapping ModelPatchers", 1, 1)
