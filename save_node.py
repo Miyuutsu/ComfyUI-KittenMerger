@@ -408,62 +408,76 @@ class AnimaModelSaver:
     ):
         out_dtype = forced_dtype
         if out_dtype is None:
-            if raw_obj._precomputed_sd:
+            if raw_obj.lora_entries:
+                first_entry = next(iter(raw_obj.lora_entries.values()), None)
+                sample_t = (
+                    (first_entry.get("up") if first_entry.get("up") is not None else first_entry.get("diff"))
+                    if isinstance(first_entry, dict)
+                    else None
+                )
+                out_dtype = sample_t.dtype if isinstance(sample_t, torch.Tensor) else torch.bfloat16
+            elif raw_obj._precomputed_sd:
                 first_t = next(iter(raw_obj._precomputed_sd.values()), None)
                 out_dtype = first_t.dtype if isinstance(first_t, torch.Tensor) else torch.bfloat16
             else:
                 out_dtype = torch.bfloat16
 
-        # Fast path: unmerged or single-LoRA-scaled standalone LoRA with existing low-rank (up, down) tensors
-        if (
-            raw_obj._precomputed_sd is None
-            and raw_obj.lora_entries
-            and lora_format == "lora (SVD)"
-        ):
-            out_sd = {}
-            base_strength = float(getattr(raw_obj, "strength", 1.0))
-            for k, entry in raw_obj.lora_entries.items():
-                if not isinstance(entry, dict):
-                    continue
-                entry_scale = float(entry.get("scale", 1.0))
-                eff_strength = base_strength * entry_scale
-                if abs(eff_strength) <= 1e-7:
-                    continue
-                prefix = _normalize_kohya_lora_prefix(k)
-                if "up" in entry and "down" in entry and entry["up"] is not None and entry["down"] is not None:
-                    up_t = entry["up"].detach()
-                    down_t = entry["down"].detach().to(device="cpu", dtype=out_dtype)
-                    rank = down_t.shape[0]
-                    raw_alpha = float(entry.get("alpha") if entry.get("alpha") is not None else rank)
-                    if eff_strength < 0.0:
-                        up_t = (-up_t.float()).to(device="cpu", dtype=out_dtype)
-                        alpha = raw_alpha * abs(eff_strength)
-                    else:
-                        up_t = up_t.to(device="cpu", dtype=out_dtype)
-                        alpha = raw_alpha * eff_strength
-                    out_sd[f"{prefix}.lora_up.weight"] = up_t.contiguous()
-                    out_sd[f"{prefix}.lora_down.weight"] = down_t.contiguous()
-                    out_sd[f"{prefix}.alpha"] = torch.tensor(float(alpha), dtype=torch.float32)
-                    if dora_scale_mode != "drop" and hasattr(raw_obj, "get_dora_scale"):
-                        ds = raw_obj.get_dora_scale(k, mode=dora_scale_mode)
-                        if ds is not None:
-                            out_sd[f"{prefix}.dora_scale"] = ds.detach().to(device="cpu", dtype=out_dtype).contiguous()
-                elif "diff" in entry and entry["diff"] is not None:
-                    diff_t = (entry["diff"].detach().float() * eff_strength).to(dtype=out_dtype).contiguous().cpu()
-                    out_sd[f"{prefix}.diff"] = diff_t
-            if out_sd:
-                return out_sd
+        precomputed_map = raw_obj._precomputed_sd or {}
+        lowrank_map = raw_obj.lora_entries or {}
+        base_strength = float(getattr(raw_obj, "strength", 1.0))
 
         keys = sorted(raw_obj.get_key_set(), key=str)
         total_k = max(1, len(keys))
         out_sd = {}
+        lossless_count = 0
+        svd_count = 0
 
         for idx, k in enumerate(keys, start=1):
-            if idx % 16 == 0 or idx == total_k:
+            if (
+                lora_format == "lora (SVD)"
+                and k not in precomputed_map
+                and k in lowrank_map
+            ):
+                entry = lowrank_map[k]
+                if isinstance(entry, dict):
+                    entry_scale = float(entry.get("scale", 1.0))
+                    eff_strength = base_strength * entry_scale
+                    if abs(eff_strength) <= 1e-7:
+                        continue
+                    prefix = _normalize_kohya_lora_prefix(k)
+                    if "up" in entry and "down" in entry and entry["up"] is not None and entry["down"] is not None:
+                        up_t = entry["up"].detach()
+                        down_t = entry["down"].detach().to(device="cpu", dtype=out_dtype)
+                        rank = down_t.shape[0]
+                        raw_alpha = float(entry.get("alpha") if entry.get("alpha") is not None else rank)
+                        if eff_strength < 0.0:
+                            up_t = (-up_t.float()).to(device="cpu", dtype=out_dtype)
+                            alpha = raw_alpha * abs(eff_strength)
+                        else:
+                            up_t = up_t.to(device="cpu", dtype=out_dtype)
+                            alpha = raw_alpha * eff_strength
+                        out_sd[f"{prefix}.lora_up.weight"] = up_t.contiguous()
+                        out_sd[f"{prefix}.lora_down.weight"] = down_t.contiguous()
+                        out_sd[f"{prefix}.alpha"] = torch.tensor(float(alpha), dtype=torch.float32)
+                        if dora_scale_mode != "drop" and hasattr(raw_obj, "get_dora_scale"):
+                            ds = raw_obj.get_dora_scale(k, mode=dora_scale_mode)
+                            if ds is not None:
+                                out_sd[f"{prefix}.dora_scale"] = (
+                                    ds.detach().to(device="cpu", dtype=out_dtype).contiguous()
+                                )
+                        lossless_count += 1
+                        continue
+                    elif "diff" in entry and entry["diff"] is not None:
+                        diff_t = (entry["diff"].detach().float() * eff_strength).to(dtype=out_dtype).contiguous().cpu()
+                        out_sd[f"{prefix}.diff"] = diff_t
+                        lossless_count += 1
+                        continue
+
+            if svd_count % 8 == 0 or idx == total_k:
                 send_kitten_progress(
                     unique_id,
                     f"Decomposing LoRA ({lora_format}, rank={lora_rank})",
-                    f"Key {idx}/{total_k}",
+                    f"Key {idx}/{total_k} ({svd_count} SVD, {lossless_count} lossless)",
                     idx,
                     total_k,
                 )
@@ -490,8 +504,13 @@ class AnimaModelSaver:
                     ds = raw_obj.get_dora_scale(k, mode=dora_scale_mode)
                     if ds is not None:
                         out_sd[f"{prefix}.dora_scale"] = ds.detach().to(device="cpu", dtype=out_dtype).contiguous()
+                svd_count += 1
             del delta_t
 
+        print(  # noqa: T201
+            f"[KittenMerger] LoRA extraction: {lossless_count} lossless low-rank keys, "
+            f"{svd_count} SVD-decomposed keys (clamp_lora={clamp_lora})"
+        )
         return out_sd
 
     def _extract_component_sd(

@@ -870,22 +870,14 @@ class AnimaModelMerger:
         dora_scales_merged=None,
     ):
         if template_mp is None or getattr(template_mp, "_kitten_is_lora", False):
-            if lora_entries is not None and not target_sd:
-                lora_out = KittenLoRAModel(
-                    lora_entries=lora_entries,
-                    strength=lora_strength,
-                    name=display_name or stage_id or source_id or "lora",
-                    dora_scales_passthrough=dora_scales_passthrough,
-                    dora_scales_merged=dora_scales_merged,
-                )
-            else:
-                lora_out = KittenLoRAModel(
-                    precomputed_sd=target_sd,
-                    strength=1.0,
-                    name=display_name or stage_id or source_id or "merged_lora",
-                    dora_scales_passthrough=dora_scales_passthrough,
-                    dora_scales_merged=dora_scales_merged,
-                )
+            lora_out = KittenLoRAModel(
+                lora_entries=lora_entries if lora_entries else None,
+                strength=lora_strength if (lora_entries and not target_sd) else 1.0,
+                precomputed_sd=target_sd if target_sd else None,
+                name=display_name or stage_id or source_id or "merged_lora",
+                dora_scales_passthrough=dora_scales_passthrough,
+                dora_scales_merged=dora_scales_merged,
+            )
             lora_out._kitten_merged = merged_flag
             lora_out._kitten_stage_id = stage_id
             lora_out._kitten_source_id = source_id
@@ -1374,15 +1366,12 @@ class AnimaModelMerger:
             if s_id not in active_stage_ids:
                 continue
 
-            can_preserve_lowrank = (
-                out_stage_is_lora
-                and model_a_id == model_b_id
-                and model_a_id in aligned_lora_entries
-                and (not has_model_c or model_c_id == model_a_id)
+            can_preserve_lowrank = out_stage_is_lora and (
+                model_a_id in aligned_lora_entries or model_b_id in aligned_lora_entries
             )
             if can_preserve_lowrank:
                 aligned_lora_entries[s_id] = {}
-                lora_strengths[s_id] = lora_strengths.get(model_a_id, 1.0)
+                lora_strengths[s_id] = 1.0
 
             sources_sd[s_id] = {}
             sources_lineage[s_id] = {}
@@ -1571,16 +1560,15 @@ class AnimaModelMerger:
                         return gpu_calc_tensors[src_id]
                     if src_id in aligned_lora_entries:
                         entry = aligned_lora_entries[src_id].get(k)
-                        if entry is None:
-                            return None
-                        gt = materialize_single_lora_entry(
-                            entry,
-                            lora_strengths.get(src_id, 1.0),
-                            dtype=calc_dtype,
-                            device=device,
-                        )
-                        gpu_calc_tensors[src_id] = gt
-                        return gt
+                        if entry is not None:
+                            gt = materialize_single_lora_entry(
+                                entry,
+                                lora_strengths.get(src_id, 1.0),
+                                dtype=calc_dtype,
+                                device=device,
+                            )
+                            gpu_calc_tensors[src_id] = gt
+                            return gt
                     cpu_t = cpu_exact_refs.get(src_id)
                     if cpu_t is None and src_id in sources_sd:
                         cpu_t = sources_sd[src_id].get(k)
@@ -1732,31 +1720,151 @@ class AnimaModelMerger:
                                 precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = 0.0
                             continue
 
-                    if ps.get("can_preserve_lowrank") and not need_stage_norm and not has_downstream_inspector:
-                        src_entry = aligned_lora_entries[model_a_id].get(k)
-                        if src_entry is None:
-                            continue
-                        if op == "ws":
-                            scale_factor = 1.0
-                        elif op == "add":
-                            scale_factor = 1.0 + float(w)
-                        elif op == "sub":
-                            scale_factor = 1.0 - float(w)
-                        elif op == "add_diff":
-                            scale_factor = 1.0 if has_model_c else (1.0 + float(w))
-                        else:
-                            scale_factor = 1.0
-                        new_scale = float(src_entry.get("scale", 1.0)) * scale_factor
-                        if abs(new_scale) > 1e-7:
-                            new_entry = dict(src_entry)
-                            new_entry["scale"] = new_scale
-                            aligned_lora_entries[s_id][k] = new_entry
-                            sources_lineage[s_id][k] = combine_lineage_dicts([(scale_factor, lin_a)])
-                            direct_stage_lineage[s_id][k] = {model_a_id: round(scale_factor, 6)}
-                        else:
+                    if ps.get("can_preserve_lowrank"):
+                        a_entry = aligned_lora_entries.get(model_a_id, {}).get(k)
+                        b_entry = aligned_lora_entries.get(model_b_id, {}).get(k)
+                        a_has_dense = (
+                            (model_a_id in gpu_calc_tensors)
+                            or (cpu_exact_refs.get(model_a_id) is not None)
+                            or (k in sources_sd.get(model_a_id, {}))
+                        )
+                        b_has_dense = (
+                            (model_b_id in gpu_calc_tensors)
+                            or (cpu_exact_refs.get(model_b_id) is not None)
+                            or (k in sources_sd.get(model_b_id, {}))
+                        )
+                        a_zero = (a_entry is None) and (not a_has_dense)
+                        b_zero = (b_entry is None) and (not b_has_dense)
+
+                        lowrank_target = None
+                        is_known_zero = False
+
+                        if model_a_id == model_b_id and (not has_model_c or model_c_id == model_a_id):
+                            if a_zero:
+                                is_known_zero = True
+                            elif a_entry is not None:
+                                if op == "ws":
+                                    sf = 1.0
+                                elif op == "add":
+                                    sf = 1.0 + float(w)
+                                elif op == "sub":
+                                    sf = 1.0 - float(w)
+                                elif op == "add_diff":
+                                    sf = 1.0 if has_model_c else (1.0 + float(w))
+                                else:
+                                    sf = 1.0
+                                lowrank_target = (model_a_id, a_entry, sf, lin_a)
+                        elif not has_model_c:
+                            if a_zero and b_zero:
+                                is_known_zero = True
+                            elif op == "ws":
+                                if abs(w - 1.0) <= 1e-7:
+                                    if a_zero:
+                                        is_known_zero = True
+                                    elif a_entry is not None:
+                                        lowrank_target = (model_a_id, a_entry, 1.0, lin_a)
+                                elif abs(w) <= 1e-7:
+                                    if b_zero:
+                                        is_known_zero = True
+                                    elif b_entry is not None:
+                                        lowrank_target = (model_b_id, b_entry, 1.0, lin_b)
+                                elif b_zero and a_entry is not None:
+                                    lowrank_target = (model_a_id, a_entry, float(w), lin_a)
+                                elif a_zero and b_entry is not None:
+                                    lowrank_target = (model_b_id, b_entry, 1.0 - float(w), lin_b)
+                            elif op in ("add", "sub"):
+                                sign = 1.0 if op == "add" else -1.0
+                                if abs(w) <= 1e-7 or b_zero:
+                                    if a_zero:
+                                        is_known_zero = True
+                                    elif a_entry is not None:
+                                        lowrank_target = (model_a_id, a_entry, 1.0, lin_a)
+                                elif a_zero and b_entry is not None:
+                                    lowrank_target = (model_b_id, b_entry, sign * float(w), lin_b)
+                            elif op in ("cosine_a", "cosine_b") and abs(1.0 - float(w)) <= 1e-7:
+                                if a_zero:
+                                    is_known_zero = True
+                                elif a_entry is not None:
+                                    lowrank_target = (model_a_id, a_entry, 1.0, lin_a)
+
+                        if is_known_zero:
                             dora_pt_by_source[s_id].pop(k, None)
                             dora_mg_by_source[s_id].pop(k, None)
-                        continue
+                            if need_stage_norm:
+                                precomputed_stats[s_id][k] = (0.0, False)
+                            continue
+
+                        if lowrank_target is not None:
+                            src_id, src_entry, scale_factor, src_lin = lowrank_target
+                            base_str = float(lora_strengths.get(src_id, 1.0))
+                            new_scale = float(src_entry.get("scale", 1.0)) * base_str * float(scale_factor)
+                            if abs(new_scale) > 1e-7:
+                                new_entry = dict(src_entry)
+                                new_entry["scale"] = new_scale
+                                aligned_lora_entries[s_id][k] = new_entry
+                                sources_lineage[s_id][k] = combine_lineage_dicts([(float(scale_factor), src_lin)])
+                                direct_stage_lineage[s_id][k] = {src_id: round(float(scale_factor), 6)}
+                                if src_id == model_a_id and model_a_id != model_b_id:
+                                    pt_a = dora_pt_by_source.get(model_a_id, {}).get(k)
+                                    mg_a = dora_mg_by_source.get(model_a_id, {}).get(k)
+                                    if pt_a is not None:
+                                        dora_pt_by_source[s_id][k] = pt_a
+                                    else:
+                                        dora_pt_by_source[s_id].pop(k, None)
+                                    if mg_a is not None:
+                                        dora_mg_by_source[s_id][k] = mg_a
+                                    else:
+                                        dora_mg_by_source[s_id].pop(k, None)
+                                elif src_id == model_b_id and model_a_id != model_b_id:
+                                    pt_b = dora_pt_by_source.get(model_b_id, {}).get(k)
+                                    mg_b = dora_mg_by_source.get(model_b_id, {}).get(k)
+                                    if pt_b is not None:
+                                        dora_pt_by_source[s_id][k] = pt_b
+                                    else:
+                                        dora_pt_by_source[s_id].pop(k, None)
+                                    if mg_b is not None:
+                                        dora_mg_by_source[s_id][k] = mg_b
+                                    else:
+                                        dora_mg_by_source[s_id].pop(k, None)
+
+                                if need_stage_norm:
+                                    if src_id in precomputed_stats and k in precomputed_stats[src_id]:
+                                        sw, snan = precomputed_stats[src_id][k]
+                                        precomputed_stats[s_id][k] = (
+                                            (sw * abs(float(scale_factor))) if sw is not None else 0.0,
+                                            snan,
+                                        )
+                                    else:
+                                        gt_src = get_calc_tensor(src_id)
+                                        sw, snan = (
+                                            inspect_tensor_stats(gt_src, device=device)
+                                            if gt_src is not None
+                                            else (0.0, False)
+                                        )
+                                        precomputed_stats[s_id][k] = (sw * abs(float(scale_factor)), snan)
+                                if has_downstream_inspector:
+                                    if abs(float(scale_factor) - 1.0) <= 1e-7:
+                                        precomputed_pair_diffs.setdefault((src_id, s_id), {})[k] = 0.0
+                                    else:
+                                        gt_src = get_calc_tensor(src_id)
+                                        if gt_src is not None:
+                                            precomputed_pair_diffs.setdefault((src_id, s_id), {})[k] = (
+                                                inspect_tensor_diff(
+                                                    gt_src, gt_src * float(scale_factor), device=device
+                                                )
+                                            )
+                            else:
+                                dora_pt_by_source[s_id].pop(k, None)
+                                dora_mg_by_source[s_id].pop(k, None)
+                                if need_stage_norm:
+                                    precomputed_stats[s_id][k] = (0.0, False)
+                                if has_downstream_inspector:
+                                    gt_src = get_calc_tensor(src_id)
+                                    if gt_src is not None:
+                                        precomputed_pair_diffs.setdefault((src_id, s_id), {})[k] = (
+                                            inspect_tensor_diff(gt_src, torch.zeros_like(gt_src), device=device)
+                                        )
+                            continue
 
                     merged_gpu, is_exact_a, is_exact_b = eval_single_key_stage_recipe(
                         ps,

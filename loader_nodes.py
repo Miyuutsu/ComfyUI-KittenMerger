@@ -419,7 +419,7 @@ class KittenLoRAModel:
         self.model = _DummyInnerModel(self._get_default_state_dict)
 
     def _get_default_state_dict(self):
-        if self._precomputed_sd is not None:
+        if self._precomputed_sd is not None and not self.lora_entries:
             return self._precomputed_sd
         if self._cached_fp32_sd is None:
             device = comfy.model_management.get_torch_device()
@@ -427,9 +427,10 @@ class KittenLoRAModel:
         return self._cached_fp32_sd
 
     def get_key_set(self):
-        if self._precomputed_sd is not None:
-            return set(self._precomputed_sd.keys())
-        return set(self.lora_entries.keys())
+        keys = set(self.lora_entries.keys()) if self.lora_entries else set()
+        if self._precomputed_sd:
+            keys |= set(self._precomputed_sd.keys())
+        return keys
 
     def get_dora_scale(self, key, mode="passthrough"):
         if mode == "drop":
@@ -448,18 +449,17 @@ class KittenLoRAModel:
     def materialize_key(self, key, dtype=torch.float32, device=None):
         forced_dt = getattr(self, "_kitten_forced_dtype", None) or dtype
         target_dev = device if device is not None else comfy.model_management.get_torch_device()
-        if self._precomputed_sd is not None:
+        if self._precomputed_sd and key in self._precomputed_sd:
             t = self._precomputed_sd.get(key)
-            if t is None:
-                return None
-            return t.to(device=target_dev, dtype=forced_dt)
+            if t is not None:
+                return t.to(device=target_dev, dtype=forced_dt)
         entry = self.lora_entries.get(key)
         if entry is None:
             return None
         return materialize_single_lora_entry(entry, self.strength, dtype=forced_dt, device=target_dev)
 
     def materialize_state_dict(self, dtype=torch.float32, device=None):
-        if self._precomputed_sd is not None:
+        if self._precomputed_sd is not None and not self.lora_entries:
             return {
                 k: v.to(dtype=dtype).contiguous().cpu()
                 for k, v in self._precomputed_sd.items()
@@ -467,14 +467,19 @@ class KittenLoRAModel:
 
         target_dev = device if device is not None else comfy.model_management.get_torch_device()
         out_sd = {}
-        keys = list(self.lora_entries.keys())
-        for i in range(0, len(keys), 32):
-            for k in keys[i:i+32]:
-                entry = self.lora_entries[k]
-                delta = materialize_single_lora_entry(entry, self.strength, dtype=dtype, device=target_dev)
-                if delta is not None:
-                    out_sd[k] = delta.detach().cpu().contiguous()
-            _gc.collect()
+        if self.lora_entries:
+            keys = list(self.lora_entries.keys())
+            for i in range(0, len(keys), 32):
+                for k in keys[i:i+32]:
+                    entry = self.lora_entries[k]
+                    delta = materialize_single_lora_entry(entry, self.strength, dtype=dtype, device=target_dev)
+                    if delta is not None:
+                        out_sd[k] = delta.detach().cpu().contiguous()
+                _gc.collect()
+        if self._precomputed_sd:
+            for k, v in self._precomputed_sd.items():
+                if v is not None:
+                    out_sd[k] = v.to(dtype=dtype).contiguous().cpu()
         return out_sd
 
     def clone(self):
