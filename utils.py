@@ -264,13 +264,18 @@ def materialize_patched_state_dict(model_patcher, device=None):
     Returns a dict of resolved tensors (on CPU) for a ModelPatcher.
     Preserves forced or merged stage precision (e.g. fp32 / fp64) when present.
     """
-    base_sd = model_patcher.model.state_dict()
+    raw_base_sd = model_patcher.model.state_dict()
+    base_sd = {
+        k: v
+        for k, v in raw_base_sd.items()
+        if not strip_diffusion_prefix(k).startswith("model_sampling.")
+    }
     patches = getattr(model_patcher, "patches", {})
     forced_dtype = getattr(model_patcher, "_kitten_forced_dtype", None)
     preserve_patch_dtype = bool(getattr(model_patcher, "_kitten_merged", False)) or (forced_dtype is not None)
 
     if not patches and forced_dtype is None:
-        return dict(base_sd)
+        return base_sd
 
     out = {}
     for k, base_t in base_sd.items():
@@ -655,66 +660,6 @@ def downscale_dict_single_stage(state_dict, manifest, absorb_arg, ratio, device)
     return new_state_dict
 
 
-def upscale_dict_single_stage(state_dict, manifest, fill_mode, ratio, device, is_lora=False):
-    source_to_target = build_source_to_target_map(manifest)
-    inserted_to_source = {int(k): int(v) for k, v in manifest.get("inserted_to_source", {}).items()}
-    insertion_positions = manifest.get("insertion_positions", list(inserted_to_source))
-
-    new_state_dict = {}
-    keys_by_old_block = {}
-
-    for k, v in state_dict.items():
-        prefix, b_idx, suffix = parse_key_for_block(k)
-        if b_idx is not None:
-            keys_by_old_block.setdefault(b_idx, []).append((prefix, suffix, k))
-        else:
-            new_state_dict[k] = v
-
-    for old_idx, keys in keys_by_old_block.items():
-        if old_idx not in source_to_target:
-            continue
-        new_idx = source_to_target[old_idx]
-        for prefix, suffix, orig_key in keys:
-            new_key = f"{prefix}{new_idx}{suffix}"
-            new_state_dict[new_key] = state_dict[orig_key]
-
-    zero_gates = fill_mode in ("skip_inserted", "zero_gates")
-
-    for new_idx in insertion_positions:
-        front_old_idx = inserted_to_source.get(new_idx)
-        if front_old_idx is None:
-            continue
-        back_old_idx = front_old_idx + 1
-
-        for prefix, suffix, orig_front_key in keys_by_old_block.get(front_old_idx, []):
-            new_key = f"{prefix}{new_idx}{suffix}"
-            orig_t = state_dict[orig_front_key]
-
-            should_zero = zero_gates and (is_lora or any(suffix.endswith(z) for z in ZERO_INIT_SUFFIXES))
-            if should_zero:
-                if not is_lora:
-                    new_state_dict[new_key] = torch.zeros_like(orig_t).cpu()
-                continue
-
-            front_tensor = orig_t.to(device=device, dtype=torch.float32)
-            orig_back_key = None
-            for p, s, k in keys_by_old_block.get(back_old_idx, []):
-                if p == prefix and s == suffix:
-                    orig_back_key = k
-                    break
-
-            if orig_back_key and orig_back_key in state_dict:
-                back_tensor = state_dict[orig_back_key].to(device=device, dtype=torch.float32)
-                blended = (front_tensor * ratio) + (back_tensor * (1.0 - ratio))
-            else:
-                blended = front_tensor
-
-            new_state_dict[new_key] = blended.to(dtype=orig_t.dtype).contiguous().cpu()
-
-    skipped_blocks = set(insertion_positions) if fill_mode == "skip_inserted" else set()
-    return new_state_dict, skipped_blocks
-
-
 def convert_state_dict_to_tier(
     state_dict,
     current_tier,
@@ -750,14 +695,165 @@ def convert_state_dict_to_tier(
 
     return sd, skipped
 
-def _remap_lora_entries_single_stage(lora_entries, manifest, is_downscale):
+def upscale_dict_single_stage(state_dict, manifest, fill_mode, ratio, device, is_lora=False):
+    source_to_target = build_source_to_target_map(manifest)
+    inserted_to_source = {int(k): int(v) for k, v in manifest.get("inserted_to_source", {}).items()}
+    insertion_positions = manifest.get("insertion_positions", list(inserted_to_source))
+
+    new_state_dict = {}
+    keys_by_old_block = {}
+
+    for k, v in state_dict.items():
+        prefix, b_idx, suffix = parse_key_for_block(k)
+        if b_idx is not None:
+            keys_by_old_block.setdefault(b_idx, []).append((prefix, suffix, k))
+        else:
+            new_state_dict[k] = v
+
+    for old_idx, keys in keys_by_old_block.items():
+        if old_idx not in source_to_target:
+            continue
+        new_idx = source_to_target[old_idx]
+        for prefix, suffix, orig_key in keys:
+            new_key = f"{prefix}{new_idx}{suffix}"
+            new_state_dict[new_key] = state_dict[orig_key]
+
+    zero_gates = fill_mode in ("skip_inserted", "zero_gates")
+
+    for new_idx in insertion_positions:
+        front_old_idx = inserted_to_source.get(new_idx)
+        if front_old_idx is None:
+            continue
+        back_old_idx = front_old_idx + 1
+
+        for prefix, suffix, orig_front_key in keys_by_old_block.get(front_old_idx, []):
+            new_key = f"{prefix}{new_idx}{suffix}"
+            orig_t = state_dict[orig_front_key]
+
+            is_gate_sfx = any(suffix.endswith(z) for z in ZERO_INIT_SUFFIXES)
+            should_zero = zero_gates and ((is_lora and fill_mode == "skip_inserted") or is_gate_sfx)
+            if should_zero:
+                if not is_lora:
+                    new_state_dict[new_key] = torch.zeros_like(orig_t).cpu()
+                continue
+
+            front_tensor = orig_t.to(device=device, dtype=torch.float32)
+            orig_back_key = None
+            for p, s, k in keys_by_old_block.get(back_old_idx, []):
+                if p == prefix and s == suffix:
+                    orig_back_key = k
+                    break
+
+            if orig_back_key and orig_back_key in state_dict:
+                back_tensor = state_dict[orig_back_key].to(device=device, dtype=torch.float32)
+                blended = (front_tensor * ratio) + (back_tensor * (1.0 - ratio))
+            else:
+                blended = front_tensor
+
+            new_state_dict[new_key] = blended.to(dtype=orig_t.dtype).contiguous().cpu()
+
+    skipped_blocks = set(insertion_positions) if fill_mode == "skip_inserted" else set()
+    return new_state_dict, skipped_blocks
+
+
+def _blend_two_lora_entries(front_entry, back_entry, ratio):
+    r = float(ratio)
+    if back_entry is None or abs(r - 1.0) <= 1e-7:
+        out = dict(front_entry)
+        out["scale"] = float(front_entry.get("scale", 1.0)) * r
+        return out
+    if front_entry is None or abs(r) <= 1e-7:
+        out = dict(back_entry)
+        out["scale"] = float(back_entry.get("scale", 1.0)) * (1.0 - r)
+        return out
+
+    if not isinstance(front_entry, dict) or not isinstance(back_entry, dict):
+        return dict(front_entry) if isinstance(front_entry, dict) else front_entry
+
+    out = {}
+    dora_f = front_entry.get("dora_scale")
+    dora_b = back_entry.get("dora_scale")
+    if dora_f is not None and dora_b is not None and dora_f.shape == dora_b.shape:
+        out["dora_scale"] = (
+            torch.lerp(dora_b.detach().float(), dora_f.detach().float(), r)
+            .to(dtype=dora_f.dtype)
+            .contiguous()
+            .cpu()
+        )
+    elif dora_f is not None:
+        out["dora_scale"] = dora_f
+    elif dora_b is not None:
+        out["dora_scale"] = dora_b
+
+    if (
+        "up" in front_entry
+        and "down" in front_entry
+        and "up" in back_entry
+        and "down" in back_entry
+        and front_entry["up"] is not None
+        and front_entry["down"] is not None
+        and back_entry["up"] is not None
+        and back_entry["down"] is not None
+    ):
+        up_f, down_f = front_entry["up"].detach(), front_entry["down"].detach()
+        up_b, down_b = back_entry["up"].detach(), back_entry["down"].detach()
+
+        if up_f.shape[0] == up_b.shape[0] and down_f.shape[1:] == down_b.shape[1:]:
+            rk_f = down_f.shape[0]
+            rk_b = down_b.shape[0]
+            alpha_f = float(front_entry.get("alpha") if front_entry.get("alpha") is not None else rk_f)
+            alpha_b = float(back_entry.get("alpha") if back_entry.get("alpha") is not None else rk_b)
+            sc_f = float(front_entry.get("scale", 1.0)) * (alpha_f / max(1, rk_f)) * r
+            sc_b = float(back_entry.get("scale", 1.0)) * (alpha_b / max(1, rk_b)) * (1.0 - r)
+
+            sign_f = -1.0 if sc_f < 0.0 else 1.0
+            sign_b = -1.0 if sc_b < 0.0 else 1.0
+            sqrt_f = math.sqrt(abs(sc_f))
+            sqrt_b = math.sqrt(abs(sc_b))
+
+            orig_dt = up_f.dtype
+            up_cat = torch.cat(
+                [
+                    (up_f.float() * (sign_f * sqrt_f)).to(dtype=orig_dt),
+                    (up_b.float() * (sign_b * sqrt_b)).to(dtype=orig_dt),
+                ],
+                dim=1,
+            ).contiguous().cpu()
+            down_cat = torch.cat(
+                [
+                    (down_f.float() * sqrt_f).to(dtype=orig_dt),
+                    (down_b.float() * sqrt_b).to(dtype=orig_dt),
+                ],
+                dim=0,
+            ).contiguous().cpu()
+
+            out["up"] = up_cat
+            out["down"] = down_cat
+            out["alpha"] = float(rk_f + rk_b)
+            out["scale"] = 1.0
+            return out
+
+    if "diff" in front_entry and "diff" in back_entry and front_entry["diff"] is not None and back_entry["diff"] is not None:
+        df = front_entry["diff"].detach().float() * float(front_entry.get("scale", 1.0))
+        db = back_entry["diff"].detach().float() * float(back_entry.get("scale", 1.0))
+        if df.shape == db.shape:
+            out["diff"] = torch.lerp(db, df, r).to(dtype=front_entry["diff"].dtype).contiguous().cpu()
+            out["scale"] = 1.0
+            return out
+
+    out.update(front_entry)
+    return out
+
+
+def _remap_lora_entries_single_stage(lora_entries, manifest, is_downscale, fill_mode="skip_inserted", ratio=0.5):
     source_to_target = build_source_to_target_map(manifest)
     target_to_source = {v: k for k, v in source_to_target.items()}
-    insertion_positions = set(
-        manifest.get("insertion_positions", [int(k) for k in manifest.get("inserted_to_source", {})])
-    )
+    inserted_to_source = {int(k): int(v) for k, v in manifest.get("inserted_to_source", {}).items()}
+    insertion_positions = set(manifest.get("insertion_positions", list(inserted_to_source)))
 
     out_entries = {}
+    entries_by_old_block = {}
+
     for k, entry in lora_entries.items():
         prefix, b_idx, suffix = parse_key_for_block(k)
         if b_idx is None:
@@ -769,14 +865,38 @@ def _remap_lora_entries_single_stage(lora_entries, manifest, is_downscale):
             new_idx = target_to_source[b_idx]
             out_entries[f"{prefix}{new_idx}{suffix}"] = entry
         else:
+            entries_by_old_block.setdefault(b_idx, []).append((prefix, suffix, k, entry))
             if b_idx not in source_to_target:
                 continue
             new_idx = source_to_target[b_idx]
             out_entries[f"{prefix}{new_idx}{suffix}"] = entry
+
+    if not is_downscale and fill_mode in ("interpolate_neighbors", "zero_gates"):
+        for new_idx in sorted(insertion_positions):
+            front_old_idx = inserted_to_source.get(new_idx)
+            if front_old_idx is None:
+                continue
+            back_old_idx = front_old_idx + 1
+            back_lookup = {
+                (p, s): e for p, s, _, e in entries_by_old_block.get(back_old_idx, [])
+            }
+            for prefix, suffix, _, front_entry in entries_by_old_block.get(front_old_idx, []):
+                if fill_mode == "zero_gates" and any(suffix.endswith(z) for z in ZERO_INIT_SUFFIXES):
+                    continue
+                back_entry = back_lookup.get((prefix, suffix))
+                new_key = f"{prefix}{new_idx}{suffix}"
+                out_entries[new_key] = _blend_two_lora_entries(front_entry, back_entry, ratio)
+
     return out_entries
 
 
-def convert_lora_entries_to_tier(lora_entries, current_tier, target_tier, upscale_fill_mode="skip_inserted"):
+def convert_lora_entries_to_tier(
+    lora_entries,
+    current_tier,
+    target_tier,
+    upscale_fill_mode="skip_inserted",
+    ratio=0.5,
+):
     if current_tier == target_tier or current_tier is None:
         return dict(lora_entries), set()
 
@@ -793,7 +913,13 @@ def convert_lora_entries_to_tier(lora_entries, current_tier, target_tier, upscal
         return entries, skipped
 
     if current_tier == 28 and target_tier == 40:
-        entries = _remap_lora_entries_single_stage(entries, MANIFEST_28_TO_40, is_downscale=False)
+        entries = _remap_lora_entries_single_stage(
+            entries,
+            MANIFEST_28_TO_40,
+            is_downscale=False,
+            fill_mode=upscale_fill_mode,
+            ratio=ratio,
+        )
         if upscale_fill_mode == "skip_inserted":
             skipped = set(MANIFEST_28_TO_40["insertion_positions"])
 

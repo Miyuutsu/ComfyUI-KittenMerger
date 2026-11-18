@@ -531,6 +531,8 @@ class AnimaModelSaver:
             aligned = {}
             for k, v in casted.items():
                 clean_k = strip_diffusion_prefix(k)
+                if clean_k.startswith("model_sampling."):
+                    continue
                 if is_multi_component_mux:
                     if total_in_kind > 1:
                         pfx = f"model.diffusion_model_{idx_in_kind}."

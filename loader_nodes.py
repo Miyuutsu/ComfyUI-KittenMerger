@@ -23,6 +23,10 @@ NON_DIFFUSION_PREFIXES = (
     "clip.",
     "t5xxl.",
     "qwen.",
+    "model_sampling.",
+    "net.model_sampling.",
+    "diffusion_model.model_sampling.",
+    "model.diffusion_model.model_sampling.",
 )
 
 DIFFUSION_ROOT_PREFIXES = (
@@ -67,9 +71,12 @@ def build_anima_lora_key_map(max_blocks=60):
     weight_targets = [
         "pos_embedder.proj.weight",
         "x_embedder.proj.weight",
+        "x_embedder.proj.1.weight",
         "x_embedder.weight",
         "t_embedder.mlp.0.weight",
         "t_embedder.mlp.2.weight",
+        "t_embedder.1.linear_1.weight",
+        "t_embedder.1.linear_2.weight",
         "t_embedding_norm.weight",
         "final_layer.adaln_modulation.1.weight",
         "final_layer.adaln_modulation.2.weight",
@@ -91,6 +98,8 @@ def build_anima_lora_key_map(max_blocks=60):
             "cross_attn.v_proj",
             "cross_attn.o_proj",
             "cross_attn.output_proj",
+            "mlp.0",
+            "mlp.2",
             "mlp.gate_proj",
             "mlp.up_proj",
             "mlp.down_proj",
@@ -703,7 +712,10 @@ class AnimaLoRALoader:
             if "diff" in val or ("up" in val and "down" in val):
                 entries[k] = val
 
-        if hasattr(comfy.lora, "load_lora"):
+        has_non_standard_keys = any(
+            ".hada_" in k or ".lokr_" in k for k in lora_sd.keys()
+        )
+        if (not entries or has_non_standard_keys) and hasattr(comfy.lora, "load_lora"):
             try:
                 loaded_patches = comfy.lora.load_lora(lora_sd, ANIMA_LORA_KEY_MAP)
                 for k, p_tuple in loaded_patches.items():

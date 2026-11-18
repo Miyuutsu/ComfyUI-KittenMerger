@@ -968,7 +968,7 @@ class AnimaModelMerger:
         )
         with AnimaModelMerger._cache_lock:
             if AnimaModelMerger._last_merge_sig == merge_sig and AnimaModelMerger._last_merge_result is not None:
-                return AnimaModelMerger._last_merge_re
+                return AnimaModelMerger._last_merge_result
 
         self._evict_previous_allocations(models_dict.values())
         gc.collect()
@@ -1173,7 +1173,11 @@ class AnimaModelMerger:
                 tiers_by_id[m] = tier
             else:
                 if not active_stage_ids and not getattr(mp, "patches", None):
-                    raw_sds[m] = mp.model.state_dict()
+                    raw_sds[m] = {
+                        k: v
+                        for k, v in mp.model.state_dict().items()
+                        if not strip_diffusion_prefix(k).startswith("model_sampling.")
+                    }
                 else:
                     raw_sds[m] = materialize_patched_state_dict(mp, device=device)
                 tier, _ = detect_block_tier(raw_sds[m].keys())
@@ -1214,11 +1218,12 @@ class AnimaModelMerger:
                 if needs_tier_scale:
                     scaled_models_converted.add(m)
                     conv_entries, skipped_set = convert_lora_entries_to_tier(
-                        raw_lora_entries.pop(m),
-                        orig_tier,
-                        resolved_tier,
-                        upscale_fill_mode=upscale_fill_mode,
-                    )
+                     raw_lora_entries.pop(m),
+                     orig_tier,
+                     resolved_tier,
+                     upscale_fill_mode=upscale_fill_mode,
+                     ratio=neighbor_ratio,
+                 )
                 else:
                     conv_entries, skipped_set = raw_lora_entries.pop(m), set()
                 aligned_lora_entries[m] = conv_entries
@@ -1296,13 +1301,13 @@ class AnimaModelMerger:
                     if pt_raw:
                         pt_wrapped = {k: {"dora_scale": v} for k, v in pt_raw.items()}
                         pt_conv, _ = convert_lora_entries_to_tier(
-                            pt_wrapped, orig_t, resolved_tier, upscale_fill_mode=upscale_fill_mode
+                            pt_wrapped, orig_t, resolved_tier, upscale_fill_mode=upscale_fill_mode, ratio=neighbor_ratio
                         )
                         pt_raw = {k: v["dora_scale"] for k, v in pt_conv.items()}
                     if mg_raw:
                         mg_wrapped = {k: {"dora_scale": v} for k, v in mg_raw.items()}
                         mg_conv, _ = convert_lora_entries_to_tier(
-                            mg_wrapped, orig_t, resolved_tier, upscale_fill_mode=upscale_fill_mode
+                            mg_wrapped, orig_t, resolved_tier, upscale_fill_mode=upscale_fill_mode, ratio=neighbor_ratio
                         )
                         mg_raw = {k: v["dora_scale"] for k, v in mg_conv.items()}
                 dora_pt_by_source[m] = align_sd_keys_to_reference(pt_raw, clean_to_ref_key)
@@ -1776,22 +1781,23 @@ class AnimaModelMerger:
                         precomputed_stats[s_id][k] = inspect_tensor_stats(merged_gpu, device=device)
 
                     if has_downstream_inspector:
-                        ta_g = gpu_calc_tensors.get(model_a_id)
-                        if ta_g is not None and ta_g.shape == merged_gpu.shape and not is_a_lora:
-                            precomputed_pair_diffs.setdefault((model_a_id, s_id), {})[k] = (
-                                0.0 if is_exact_a else inspect_tensor_diff(ta_g, merged_gpu, device=device)
-                            )
-                        tb_g = gpu_calc_tensors.get(model_b_id)
-                        if tb_g is not None and tb_g.shape == merged_gpu.shape and not is_b_lora:
-                            precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = (
-                                0.0 if is_exact_b else inspect_tensor_diff(tb_g, merged_gpu, device=device)
-                            )
-                        if has_model_c and not is_c_lora:
-                            tc_g = gpu_calc_tensors.get(model_c_id)
-                            if tc_g is not None and tc_g.shape == merged_gpu.shape:
-                                precomputed_pair_diffs.setdefault((model_c_id, s_id), {})[k] = inspect_tensor_diff(
-                                    tc_g, merged_gpu, device=device
-                                )
+                     out_is_lora = ps.get("out_stage_is_lora", False)
+                     ta_g = gpu_calc_tensors.get(model_a_id)
+                     if ta_g is not None and ta_g.shape == merged_gpu.shape and (not is_a_lora or out_is_lora):
+                         precomputed_pair_diffs.setdefault((model_a_id, s_id), {})[k] = (
+                             0.0 if is_exact_a else inspect_tensor_diff(ta_g, merged_gpu, device=device)
+                         )
+                     tb_g = gpu_calc_tensors.get(model_b_id)
+                     if tb_g is not None and tb_g.shape == merged_gpu.shape and (not is_b_lora or out_is_lora):
+                         precomputed_pair_diffs.setdefault((model_b_id, s_id), {})[k] = (
+                             0.0 if is_exact_b else inspect_tensor_diff(tb_g, merged_gpu, device=device)
+                         )
+                     if has_model_c and (not is_c_lora or out_is_lora):
+                         tc_g = gpu_calc_tensors.get(model_c_id)
+                         if tc_g is not None and tc_g.shape == merged_gpu.shape:
+                             precomputed_pair_diffs.setdefault((model_c_id, s_id), {})[k] = inspect_tensor_diff(
+                                 tc_g, merged_gpu, device=device
+                             )
 
                     if is_exact_a and ref_a is not None and ref_a.dtype == store_dtype:
                         cpu_exact_refs[s_id] = ref_a

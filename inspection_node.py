@@ -164,7 +164,7 @@ class ModelMergeInspector:
     _last_cache_sig = None
     _last_cache_data = None
     _model_stats_cache = {}
-    _cache_lock = threading.Lock()
+    _cache_lock = threading.RLock()
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -280,7 +280,9 @@ class ModelMergeInspector:
         raw_sds = {}
         for m in m_ids:
             mp = models_dict[m]
-            if m in lora_m_ids and hasattr(mp, "get_key_set"):
+            if m in virtual_m_ids:
+                raw_sds[m] = {}
+            elif m in lora_m_ids and hasattr(mp, "get_key_set"):
                 raw_sds[m] = {k: None for k in mp.get_key_set()}
             else:
                 raw_sds[m] = mp.model.state_dict()
@@ -314,6 +316,10 @@ class ModelMergeInspector:
         if not base_m_ids:
             for m in lora_m_ids:
                 union_keys |= key_sets[m]
+
+        for vm in virtual_m_ids:
+            sds[vm] = {k: None for k in union_keys}
+            key_sets[vm] = set(union_keys)
 
         unmatched_lora_keys = {}
         if base_m_ids:
@@ -471,7 +477,7 @@ class ModelMergeInspector:
                 parent_max_diff = 0.0
                 has_parent = False
                 for coeff, lhs_m in lhs_pairs:
-                    if abs(coeff) <= 1e-9 or lhs_m in lora_m_ids:
+                    if abs(coeff) <= 1e-9 or (lhs_m in lora_m_ids and rhs_m not in lora_m_ids):
                         continue
                     lhs_mp = models_dict.get(lhs_m)
                     lhs_src_id = (
@@ -805,27 +811,33 @@ class ModelMergeInspector:
         precomputed_pair_diffs = getattr(merge_schema, "_kitten_precomputed_pair_diffs", None)
 
         with ModelMergeInspector._cache_lock:
-            if ModelMergeInspector._last_cache_sig == sig and ModelMergeInspector._last_cache_data is not None:
-                data = ModelMergeInspector._last_cache_data
-                timings["Scan (Cached)"] = time.perf_counter() - t_phase
-                pbar.update_absolute(80, 100)
-            else:
-                data = self._scan_models(
-                    models_dict,
-                    rules,
-                    compare_mode,
-                    change_threshold,
-                    zero_threshold,
-                    stage_recipes=stage_recipes,
-                    precomputed_stats=precomputed_stats,
-                    precomputed_pair_diffs=precomputed_pair_diffs,
-                    unique_id=unique_id,
-                    pbar=pbar,
-                )
-                with ModelMergeInspector._cache_lock:
-                    ModelMergeInspector._last_cache_sig = sig
-                    ModelMergeInspector._last_cache_data = data
-                timings["Scan & Compare"] = time.perf_counter() - t_phase
+            cached_data = (
+                ModelMergeInspector._last_cache_data
+                if ModelMergeInspector._last_cache_sig == sig
+                else None
+            )
+
+        if cached_data is not None:
+            data = cached_data
+            timings["Scan (Cached)"] = time.perf_counter() - t_phase
+            pbar.update_absolute(80, 100)
+        else:
+            data = self._scan_models(
+                models_dict,
+                rules,
+                compare_mode,
+                change_threshold,
+                zero_threshold,
+                stage_recipes=stage_recipes,
+                precomputed_stats=precomputed_stats,
+                precomputed_pair_diffs=precomputed_pair_diffs,
+                unique_id=unique_id,
+                pbar=pbar,
+            )
+            with ModelMergeInspector._cache_lock:
+                ModelMergeInspector._last_cache_sig = sig
+                ModelMergeInspector._last_cache_data = data
+            timings["Scan & Compare"] = time.perf_counter() - t_phase
 
         lora_m_ids = data.get("lora_m_ids", set())
         blocks_data = data["blocks_data"]
@@ -857,18 +869,18 @@ class ModelMergeInspector:
                     zero_blocks_list[m].append(b_idx)
 
             for r in rules:
+                rhs_m = r["rhs"]
+                rhs_is_lora = rhs_m in lora_m_ids
                 if r.get("is_kitten_json"):
                     lhs_m_ids = []
                     for rec in bd["records"]:
                         p_idx = r["key_map"].get(rec["key"])
                         if p_idx is not None and p_idx < len(r["palette"]):
                             for m_id in r["palette"][p_idx]:
-                                if m_id in m_ids and m_id not in lora_m_ids and m_id not in lhs_m_ids:
+                                if m_id in m_ids and (rhs_is_lora or m_id not in lora_m_ids) and m_id not in lhs_m_ids:
                                     lhs_m_ids.append(m_id)
                 else:
-                    lhs_m_ids = [lhs_m for _, lhs_m in r["lhs"] if lhs_m not in lora_m_ids]
-
-                rhs_m = r["rhs"]
+                    lhs_m_ids = [lhs_m for _, lhs_m in r["lhs"] if (rhs_is_lora or lhs_m not in lora_m_ids)]
                 if len(lhs_m_ids) >= 2 and bd["changed_keys"] > 0:
                     muted_parents = [m for m in lhs_m_ids if muted_map.get(m, False)]
                     active_parents = [m for m in lhs_m_ids if not muted_map.get(m, True)]
